@@ -1,0 +1,215 @@
+name: Build GP2040-CE Pico Switch 2 Fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REF: v0.7.12
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+
+      - name: Checkout GP2040-CE source
+        uses: actions/checkout@v4
+        with:
+          repository: OpenStickCommunity/GP2040-CE
+          ref: ${{ env.UPSTREAM_REF }}
+          path: gp2040-ce
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup Raspberry Pi Pico SDK
+        uses: Fortinbra/RaspberryPiPicoBuild@v7
+
+      - name: Apply BOOTSEL Switch 2 fix
+        working-directory: gp2040-ce
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          macro_file = Path("src/addons/input_macro.cpp")
+          source = macro_file.read_text()
+
+          source = source.replace(
+              '#include "hardware/gpio.h"',
+              '#include "hardware/gpio.h"\n'
+              '#include "hardware/sync.h"\n'
+              '#include "hardware/structs/ioqspi.h"\n'
+              '#include "hardware/structs/sio.h"'
+          )
+
+          marker = "bool InputMacro::available() {"
+
+          helper = r'''namespace {
+          constexpr uint64_t BOOTSEL_START_DELAY_US = 1000000;
+          constexpr uint64_t BOOTSEL_POLL_INTERVAL_US = 20000;
+          constexpr uint64_t BOOTSEL_DEBOUNCE_US = 30000;
+          constexpr int MACRO_2_INDEX = 1;
+          constexpr int MACRO_6_INDEX = 5;
+
+          uint64_t bootselStartTime = 0;
+          uint64_t bootselLastPollTime = 0;
+          uint64_t bootselChangedTime = 0;
+          bool bootselRawState = false;
+          bool bootselStableState = false;
+          bool bootselEdgeState = false;
+          int selectedMacro = MACRO_6_INDEX;
+
+          bool __no_inline_not_in_flash_func(readBootselButton)() {
+              const uint CS_PIN_INDEX = 1;
+              uint32_t flags = save_and_disable_interrupts();
+
+              hw_write_masked(
+                  &ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                  GPIO_OVERRIDE_LOW << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                  IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
+              );
+
+              for (volatile int i = 0; i < 1000; ++i) {
+              }
+
+              bool pressed = !(sio_hw->gpio_hi_in & (1u << CS_PIN_INDEX));
+
+              hw_write_masked(
+                  &ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                  GPIO_OVERRIDE_NORMAL << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                  IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
+              );
+
+              restore_interrupts(flags);
+              return pressed;
+          }
+
+          void updateBootselMacroSelector() {
+              uint64_t now = getMicro();
+
+              if (bootselStartTime == 0) {
+                  bootselStartTime = now;
+                  return;
+              }
+
+              if (now - bootselStartTime < BOOTSEL_START_DELAY_US) {
+                  return;
+              }
+
+              if (now - bootselLastPollTime < BOOTSEL_POLL_INTERVAL_US) {
+                  return;
+              }
+
+              bootselLastPollTime = now;
+              bool rawState = readBootselButton();
+
+              if (rawState != bootselRawState) {
+                  bootselRawState = rawState;
+                  bootselChangedTime = now;
+              }
+
+              if (now - bootselChangedTime >= BOOTSEL_DEBOUNCE_US &&
+                  rawState != bootselStableState) {
+                  bootselStableState = rawState;
+
+                  if (bootselStableState && !bootselEdgeState) {
+                      selectedMacro =
+                          selectedMacro == MACRO_6_INDEX
+                              ? MACRO_2_INDEX
+                              : MACRO_6_INDEX;
+                  }
+
+                  bootselEdgeState = bootselStableState;
+              }
+          }
+          }
+          '''
+
+          if marker not in source:
+              raise SystemExit("InputMacro::available marker not found")
+
+          source = source.replace(marker, helper + "\n" + marker, 1)
+
+          old_block = '''    // Go through our macro list
+          pressedMacro = -1;
+          for(int i = 0; i < MAX_MACRO_LIMIT; i++) {'''
+
+          new_block = '''    updateBootselMacroSelector();
+
+          // GP6 is the shared trigger. BOOTSEL selects macro 6 or macro 2.
+          if (macroPinMasks[MACRO_2_INDEX] &&
+              macroPinMasks[MACRO_6_INDEX] &&
+              (allPins & macroPinMasks[MACRO_2_INDEX])) {
+              pressedMacro = selectedMacro;
+              return;
+          }
+
+          // Go through our macro list
+          pressedMacro = -1;
+          for(int i = 0; i < MAX_MACRO_LIMIT; i++) {'''
+
+          if old_block not in source:
+              raise SystemExit("InputMacro trigger block not found")
+
+          source = source.replace(old_block, new_block, 1)
+          macro_file.write_text(source)
+
+          # Disable the original BOOTSEL addon. The custom selector above
+          # performs delayed, rate-limited polling instead.
+          Path("src/addons/bootsel_button.cpp").write_text(
+              '#include "addons/bootsel_button.h"\n\n'
+              'bool BootselButtonAddon::available() { return false; }\n'
+              'void BootselButtonAddon::setup() {}\n'
+              'void BootselButtonAddon::preprocess() {}\n'
+          )
+          PY
+
+      - name: Configure Pico firmware
+        working-directory: gp2040-ce
+        shell: bash
+        run: |
+          PICO_SDK_PATH="$GITHUB_WORKSPACE/gp2040-ce/pico-sdk" \
+          GP2040_BOARDCONFIG=Pico \
+          SKIP_WEBBUILD=TRUE \
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Pico UF2
+        working-directory: gp2040-ce
+        shell: bash
+        run: |
+          cmake --build build --config Release --parallel 2
+
+      - name: Calculate checksum and publish release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UF2_FILE=$(find gp2040-ce/build -maxdepth 1 -type f \
+            -name 'GP2040-CE_*_Pico.uf2' | head -n 1)
+
+          if [ -z "$UF2_FILE" ]; then
+            echo "Pico UF2 file was not generated"
+            find gp2040-ce/build -maxdepth 2 -type f | sort
+            exit 1
+          fi
+
+          sha256sum "$UF2_FILE" | tee SHA256SUMS.txt
+
+          RELEASE_TAG="switch2fix-${GITHUB_RUN_NUMBER}"
+
+          gh release create "$RELEASE_TAG" \
+            "$UF2_FILE" \
+            SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "GP2040-CE v0.7.12 Switch 2 Fix" \
+            --notes "Built from OpenStickCommunity/GP2040-CE v0.7.12. BOOTSEL polling starts after a 1-second delay, runs every 20 ms, and uses 30 ms debounce."
+        env:
+          GH_TOKEN: ${{ github.token }}
