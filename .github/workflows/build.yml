@@ -77,6 +77,7 @@ jobs:
           bool bootselStableState = false;
           bool bootselEdgeState = false;
           int selectedMacro = MACRO_6_INDEX;
+          int previouslySelectedMacro = MACRO_6_INDEX;
 
           bool __no_inline_not_in_flash_func(readBootselButton)() {
               const uint CS_PIN_INDEX = 1;
@@ -104,21 +105,22 @@ jobs:
               return pressed;
           }
 
-          // Read BOOTSEL only after startup, then poll slowly with debounce.
-          bool updateBootselMacroSelector() {
+          // BOOTSEL is not read during the first second after startup.
+          // After that it is read at most once every 20 ms with 30 ms debounce.
+          void updateBootselMacroSelector() {
               uint64_t now = getMicro();
 
               if (bootselStartTime == 0) {
                   bootselStartTime = now;
-                  return false;
+                  return;
               }
 
               if (now - bootselStartTime < BOOTSEL_START_DELAY_US) {
-                  return false;
+                  return;
               }
 
               if (now - bootselLastPollTime < BOOTSEL_POLL_INTERVAL_US) {
-                  return false;
+                  return;
               }
 
               bootselLastPollTime = now;
@@ -143,8 +145,6 @@ jobs:
 
                   bootselEdgeState = bootselStableState;
               }
-
-              return false;
           }
           }
           '''
@@ -153,15 +153,15 @@ jobs:
               raise SystemExit("InputMacro::available marker not found")
 
           # Insert the helper only once.
-          if "bool updateBootselMacroSelector()" not in source:
+          if "void updateBootselMacroSelector()" not in source:
               source = source.replace(
                   helper_marker,
                   helper_code + "\\n" + helper_marker,
                   1,
               )
 
-          # Locate only the stable comment from the official source.
-          # Do not depend on exact indentation or the complete loop format.
+          # The official source contains this stable comment. Only this marker
+          # is used, so spaces, tabs, and loop formatting do not matter.
           list_marker = "// Go through our macro list"
           list_position = source.find(list_marker)
 
@@ -170,17 +170,17 @@ jobs:
                   "Official input_macro.cpp did not contain the macro-list marker"
               )
 
-          injection = '''    updateBootselMacroSelector();
+          injection_marker = "// GP6 is the shared trigger. BOOTSEL selects macro 6 or macro 2."
 
-              // Stop the current macro when BOOTSEL changes selection.
-              // The selector is intentionally volatile only during runtime;
-              // the selected macro is not saved to flash.
-              if (selectedMacro != -1 && isMacroRunning) {
-                  static int previousSelectedMacro = MACRO_6_INDEX;
-                  if (selectedMacro != previousSelectedMacro) {
+          if injection_marker not in source:
+              injection = '''    updateBootselMacroSelector();
+
+              // Stop the currently running macro when BOOTSEL changes selection.
+              if (selectedMacro != previouslySelectedMacro) {
+                  if (isMacroRunning) {
                       reset();
-                      previousSelectedMacro = selectedMacro;
                   }
+                  previouslySelectedMacro = selectedMacro;
               }
 
               // GP6 is the shared trigger. BOOTSEL selects macro 6 or macro 2.
@@ -192,22 +192,19 @@ jobs:
               }
 
               '''
-
-          # Prevent duplicate insertion if this source is ever patched twice.
-          if "// GP6 is the shared trigger. BOOTSEL selects macro 6 or macro 2." not in source:
               source = source[:list_position] + injection + source[list_position:]
 
           macro_file.write_text(source)
 
-          # Disable the original BOOTSEL addon. Its normal preprocess() reads
-          # BOOTSEL during the regular addon cycle, which can interfere with
+          # Disable the original BOOTSEL addon. Its normal preprocess() would
+          # poll BOOTSEL during the regular addon cycle and may interfere with
           # Switch 2 USB enumeration.
           bootsel_file = Path("src/addons/bootsel_button.cpp")
           bootsel_file.write_text(
-              '#include "addons/bootsel_button.h"\\n\\n'
-              'bool BootselButtonAddon::available() { return false; }\\n'
-              'void BootselButtonAddon::setup() {}\\n'
-              'void BootselButtonAddon::preprocess() {}\\n'
+              '#include "addons/bootsel_button.h"\n\n'
+              'bool BootselButtonAddon::available() { return false; }\n'
+              'void BootselButtonAddon::setup() {}\n'
+              'void BootselButtonAddon::preprocess() {}\n'
           )
 
           print("BOOTSEL Switch 2 patch applied successfully")
@@ -217,7 +214,9 @@ jobs:
         working-directory: gp2040-ce
         shell: bash
         run: |
-          PICO_SDK_PATH="$GITHUB_WORKSPACE/gp2040-ce/pico-sdk" \
+          # The SDK setup action installs pico-sdk at the workspace root,
+          # not inside the gp2040-ce checkout directory.
+          PICO_SDK_PATH="$GITHUB_WORKSPACE/pico-sdk" \
           GP2040_BOARDCONFIG=Pico \
           SKIP_WEBBUILD=TRUE \
           cmake -B build -DCMAKE_BUILD_TYPE=Release
