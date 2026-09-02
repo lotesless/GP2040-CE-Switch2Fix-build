@@ -79,7 +79,7 @@ jobs:
               if include not in source:
                   source = source.replace(
                       include_anchor,
-                      include_anchor + "\\n" + include,
+                      include_anchor + "\n" + include,
                       1,
                   )
 
@@ -170,12 +170,11 @@ jobs:
           if helper_marker not in source:
               raise SystemExit("InputMacro::available marker not found")
 
-          if "void updateBootselMacroSelector()" not in source:
-              source = source.replace(
-                  helper_marker,
-                  helper_code + "\\n" + helper_marker,
-                  1,
-              )
+          source = source.replace(
+              helper_marker,
+              helper_code + "\n" + helper_marker,
+              1,
+          )
 
           list_marker = "// Go through our macro list"
           list_position = source.find(list_marker)
@@ -185,14 +184,9 @@ jobs:
                   "Official input_macro.cpp did not contain the macro-list marker"
               )
 
-          injection_marker = (
-              "// GP6 is the shared trigger. BOOTSEL selects macro 6 or macro 2."
-          )
+          injection = '''    updateBootselMacroSelector();
 
-          if injection_marker not in source:
-              injection = '''    updateBootselMacroSelector();
-
-              // Stop the current macro when BOOTSEL changes selection.
+              // Stop the currently running macro when BOOTSEL changes selection.
               if (selectedMacro != previousSelectedMacro) {
                   if (isMacroRunning) {
                       reset();
@@ -209,12 +203,12 @@ jobs:
               }
 
               '''
-              source = source[:list_position] + injection + source[list_position:]
 
+          source = source[:list_position] + injection + source[list_position:]
           macro_file.write_text(source)
 
-          # Disable the original BOOTSEL addon so it cannot poll BOOTSEL
-          # during the normal addon cycle and interfere with USB enumeration.
+          # Disable the original BOOTSEL addon. The custom selector above
+          # performs delayed and rate-limited polling instead.
           bootsel_file = Path("src/addons/bootsel_button.cpp")
           bootsel_file.write_text(
               '#include "addons/bootsel_button.h"\n\n'
