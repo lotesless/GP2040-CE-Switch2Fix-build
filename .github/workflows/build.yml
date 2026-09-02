@@ -38,17 +38,26 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           macro_file = Path("src/addons/input_macro.cpp")
           source = macro_file.read_text()
 
-          source = source.replace(
-              '#include "hardware/gpio.h"',
-              '#include "hardware/gpio.h"\n'
-              '#include "hardware/sync.h"\n'
-              '#include "hardware/structs/ioqspi.h"\n'
-              '#include "hardware/structs/sio.h"'
-          )
+          # Add the BOOTSEL/QSPI headers only if they are not already present.
+          include_anchor = '#include "hardware/gpio.h"'
+          required_includes = [
+              '#include "hardware/sync.h"',
+              '#include "hardware/structs/ioqspi.h"',
+              '#include "hardware/structs/sio.h"',
+          ]
+
+          for include in required_includes:
+              if include not in source:
+                  source = source.replace(
+                      include_anchor,
+                      include_anchor + "\n" + include,
+                      1,
+                  )
 
           marker = "bool InputMacro::available() {"
 
@@ -80,6 +89,7 @@ jobs:
               for (volatile int i = 0; i < 1000; ++i) {
               }
 
+              // BOOTSEL pulls the QSPI CS pin low when pressed.
               bool pressed = !(sio_hw->gpio_hi_in & (1u << CS_PIN_INDEX));
 
               hw_write_masked(
@@ -92,20 +102,23 @@ jobs:
               return pressed;
           }
 
-          void updateBootselMacroSelector() {
+          // BOOTSEL is not read during the first second after startup.
+          // Afterwards it is read at most once every 20 ms with 30 ms debounce.
+          bool updateBootselMacroSelector() {
               uint64_t now = getMicro();
+              bool selectionChanged = false;
 
               if (bootselStartTime == 0) {
                   bootselStartTime = now;
-                  return;
+                  return false;
               }
 
               if (now - bootselStartTime < BOOTSEL_START_DELAY_US) {
-                  return;
+                  return false;
               }
 
               if (now - bootselLastPollTime < BOOTSEL_POLL_INTERVAL_US) {
-                  return;
+                  return false;
               }
 
               bootselLastPollTime = now;
@@ -120,15 +133,19 @@ jobs:
                   rawState != bootselStableState) {
                   bootselStableState = rawState;
 
+                  // Toggle only on the stable press edge.
                   if (bootselStableState && !bootselEdgeState) {
                       selectedMacro =
                           selectedMacro == MACRO_6_INDEX
                               ? MACRO_2_INDEX
                               : MACRO_6_INDEX;
+                      selectionChanged = true;
                   }
 
                   bootselEdgeState = bootselStableState;
               }
+
+              return selectionChanged;
           }
           }
           '''
@@ -136,40 +153,57 @@ jobs:
           if marker not in source:
               raise SystemExit("InputMacro::available marker not found")
 
-          source = source.replace(marker, helper + "\n" + marker, 1)
+          # Do not insert the helper twice if the workflow is edited and rerun.
+          if "updateBootselMacroSelector()" not in source:
+              source = source.replace(marker, helper + "\n" + marker, 1)
 
-          old_block = '''    // Go through our macro list
-          pressedMacro = -1;
-          for(int i = 0; i < MAX_MACRO_LIMIT; i++) {'''
+          # The official source may use spaces or tabs, so match the block
+          # by structure instead of requiring one exact indentation format.
+          macro_list_pattern = re.compile(
+              r"(?ms)^[ \\t]*// Go through our macro list\\s+"
+              r"[ \\t]*pressedMacro\\s*=\\s*-1;\\s+"
+              r"[ \\t]*for\\s*\\(\\s*int\\s+i\\s*=\\s*0\\s*;"
+              r"\\s*i\\s*<\\s*MAX_MACRO_LIMIT\\s*;"
+              r"\\s*i\\+\\+\\s*\\)\\s*\\{"
+          )
 
-          new_block = '''    updateBootselMacroSelector();
+          replacement = '''    bool bootselSelectionChanged = updateBootselMacroSelector();
 
-          // GP6 is the shared trigger. BOOTSEL selects macro 6 or macro 2.
-          if (macroPinMasks[MACRO_2_INDEX] &&
-              macroPinMasks[MACRO_6_INDEX] &&
-              (allPins & macroPinMasks[MACRO_2_INDEX])) {
-              pressedMacro = selectedMacro;
-              return;
-          }
+              // Stop the currently running macro when BOOTSEL changes selection.
+              if (bootselSelectionChanged && isMacroRunning) {
+                  reset();
+              }
 
-          // Go through our macro list
-          pressedMacro = -1;
-          for(int i = 0; i < MAX_MACRO_LIMIT; i++) {'''
+              // GP6 is the shared trigger. BOOTSEL selects macro 6 or macro 2.
+              if (macroPinMasks[MACRO_2_INDEX] &&
+                  macroPinMasks[MACRO_6_INDEX] &&
+                  (allPins & macroPinMasks[MACRO_2_INDEX])) {
+                  pressedMacro = selectedMacro;
+                  return;
+              }
 
-          if old_block not in source:
-              raise SystemExit("InputMacro trigger block not found")
+              // Go through our macro list
+              pressedMacro = -1;
+              for(int i = 0; i < MAX_MACRO_LIMIT; i++) {'''
 
-          source = source.replace(old_block, new_block, 1)
+          match = macro_list_pattern.search(source)
+          if match is None:
+              raise SystemExit("InputMacro macro-list block not found")
+
+          source = macro_list_pattern.sub(replacement, source, count=1)
           macro_file.write_text(source)
 
-          # Disable the original BOOTSEL addon. The custom selector above
-          # performs delayed, rate-limited polling instead.
-          Path("src/addons/bootsel_button.cpp").write_text(
+          # Disable the original BOOTSEL addon. Its normal preprocess() polls
+          # BOOTSEL too early and can interfere with Switch 2 USB enumeration.
+          bootsel_file = Path("src/addons/bootsel_button.cpp")
+          bootsel_file.write_text(
               '#include "addons/bootsel_button.h"\n\n'
               'bool BootselButtonAddon::available() { return false; }\n'
               'void BootselButtonAddon::setup() {}\n'
               'void BootselButtonAddon::preprocess() {}\n'
           )
+
+          print("BOOTSEL Switch 2 patch applied successfully")
           PY
 
       - name: Configure Pico firmware
@@ -187,7 +221,7 @@ jobs:
         run: |
           cmake --build build --config Release --parallel 2
 
-      - name: Calculate checksum and publish release
+      - name: Locate and verify UF2
         shell: bash
         run: |
           set -euo pipefail
@@ -196,12 +230,21 @@ jobs:
             -name 'GP2040-CE_*_Pico.uf2' | head -n 1)
 
           if [ -z "$UF2_FILE" ]; then
-            echo "Pico UF2 file was not generated"
-            find gp2040-ce/build -maxdepth 2 -type f | sort
-            exit 1
+              echo "Pico UF2 file was not generated. Files found:"
+              find gp2040-ce/build -maxdepth 3 -type f | sort
+              exit 1
           fi
 
+          echo "UF2_FILE=$UF2_FILE"
           sha256sum "$UF2_FILE" | tee SHA256SUMS.txt
+
+      - name: Publish GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UF2_FILE=$(find gp2040-ce/build -maxdepth 1 -type f \
+            -name 'GP2040-CE_*_Pico.uf2' | head -n 1)
 
           RELEASE_TAG="switch2fix-${GITHUB_RUN_NUMBER}"
 
@@ -210,6 +253,6 @@ jobs:
             SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" \
             --title "GP2040-CE v0.7.12 Switch 2 Fix" \
-            --notes "Built from OpenStickCommunity/GP2040-CE v0.7.12. BOOTSEL polling starts after a 1-second delay, runs every 20 ms, and uses 30 ms debounce."
+            --notes "Built from OpenStickCommunity/GP2040-CE v0.7.12. BOOTSEL polling starts after a 1-second startup delay, runs every 20 ms, and uses 30 ms debounce."
         env:
           GH_TOKEN: ${{ github.token }}
