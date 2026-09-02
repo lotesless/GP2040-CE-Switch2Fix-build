@@ -38,12 +38,11 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
           macro_file = Path("src/addons/input_macro.cpp")
           source = macro_file.read_text()
 
-          # Add the BOOTSEL/QSPI headers only if they are not already present.
+          # Add the required BOOTSEL/QSPI headers once.
           include_anchor = '#include "hardware/gpio.h"'
           required_includes = [
               '#include "hardware/sync.h"',
@@ -51,17 +50,20 @@ jobs:
               '#include "hardware/structs/sio.h"',
           ]
 
+          if include_anchor not in source:
+              raise SystemExit("hardware/gpio.h include not found")
+
           for include in required_includes:
               if include not in source:
                   source = source.replace(
                       include_anchor,
-                      include_anchor + "\n" + include,
+                      include_anchor + "\\n" + include,
                       1,
                   )
 
-          marker = "bool InputMacro::available() {"
+          helper_marker = "bool InputMacro::available() {"
 
-          helper = r'''namespace {
+          helper_code = r'''namespace {
           constexpr uint64_t BOOTSEL_START_DELAY_US = 1000000;
           constexpr uint64_t BOOTSEL_POLL_INTERVAL_US = 20000;
           constexpr uint64_t BOOTSEL_DEBOUNCE_US = 30000;
@@ -102,11 +104,9 @@ jobs:
               return pressed;
           }
 
-          // BOOTSEL is not read during the first second after startup.
-          // Afterwards it is read at most once every 20 ms with 30 ms debounce.
+          // Read BOOTSEL only after startup, then poll slowly with debounce.
           bool updateBootselMacroSelector() {
               uint64_t now = getMicro();
-              bool selectionChanged = false;
 
               if (bootselStartTime == 0) {
                   bootselStartTime = now;
@@ -133,45 +133,54 @@ jobs:
                   rawState != bootselStableState) {
                   bootselStableState = rawState;
 
-                  // Toggle only on the stable press edge.
+                  // Toggle only on a stable button-press edge.
                   if (bootselStableState && !bootselEdgeState) {
                       selectedMacro =
                           selectedMacro == MACRO_6_INDEX
                               ? MACRO_2_INDEX
                               : MACRO_6_INDEX;
-                      selectionChanged = true;
                   }
 
                   bootselEdgeState = bootselStableState;
               }
 
-              return selectionChanged;
+              return false;
           }
           }
           '''
 
-          if marker not in source:
+          if helper_marker not in source:
               raise SystemExit("InputMacro::available marker not found")
 
-          # Do not insert the helper twice if the workflow is edited and rerun.
-          if "updateBootselMacroSelector()" not in source:
-              source = source.replace(marker, helper + "\n" + marker, 1)
+          # Insert the helper only once.
+          if "bool updateBootselMacroSelector()" not in source:
+              source = source.replace(
+                  helper_marker,
+                  helper_code + "\\n" + helper_marker,
+                  1,
+              )
 
-          # The official source may use spaces or tabs, so match the block
-          # by structure instead of requiring one exact indentation format.
-          macro_list_pattern = re.compile(
-              r"(?ms)^[ \\t]*// Go through our macro list\\s+"
-              r"[ \\t]*pressedMacro\\s*=\\s*-1;\\s+"
-              r"[ \\t]*for\\s*\\(\\s*int\\s+i\\s*=\\s*0\\s*;"
-              r"\\s*i\\s*<\\s*MAX_MACRO_LIMIT\\s*;"
-              r"\\s*i\\+\\+\\s*\\)\\s*\\{"
-          )
+          # Locate only the stable comment from the official source.
+          # Do not depend on exact indentation or the complete loop format.
+          list_marker = "// Go through our macro list"
+          list_position = source.find(list_marker)
 
-          replacement = '''    bool bootselSelectionChanged = updateBootselMacroSelector();
+          if list_position < 0:
+              raise SystemExit(
+                  "Official input_macro.cpp did not contain the macro-list marker"
+              )
 
-              // Stop the currently running macro when BOOTSEL changes selection.
-              if (bootselSelectionChanged && isMacroRunning) {
-                  reset();
+          injection = '''    updateBootselMacroSelector();
+
+              // Stop the current macro when BOOTSEL changes selection.
+              // The selector is intentionally volatile only during runtime;
+              // the selected macro is not saved to flash.
+              if (selectedMacro != -1 && isMacroRunning) {
+                  static int previousSelectedMacro = MACRO_6_INDEX;
+                  if (selectedMacro != previousSelectedMacro) {
+                      reset();
+                      previousSelectedMacro = selectedMacro;
+                  }
               }
 
               // GP6 is the shared trigger. BOOTSEL selects macro 6 or macro 2.
@@ -182,25 +191,23 @@ jobs:
                   return;
               }
 
-              // Go through our macro list
-              pressedMacro = -1;
-              for(int i = 0; i < MAX_MACRO_LIMIT; i++) {'''
+              '''
 
-          match = macro_list_pattern.search(source)
-          if match is None:
-              raise SystemExit("InputMacro macro-list block not found")
+          # Prevent duplicate insertion if this source is ever patched twice.
+          if "// GP6 is the shared trigger. BOOTSEL selects macro 6 or macro 2." not in source:
+              source = source[:list_position] + injection + source[list_position:]
 
-          source = macro_list_pattern.sub(replacement, source, count=1)
           macro_file.write_text(source)
 
-          # Disable the original BOOTSEL addon. Its normal preprocess() polls
-          # BOOTSEL too early and can interfere with Switch 2 USB enumeration.
+          # Disable the original BOOTSEL addon. Its normal preprocess() reads
+          # BOOTSEL during the regular addon cycle, which can interfere with
+          # Switch 2 USB enumeration.
           bootsel_file = Path("src/addons/bootsel_button.cpp")
           bootsel_file.write_text(
-              '#include "addons/bootsel_button.h"\n\n'
-              'bool BootselButtonAddon::available() { return false; }\n'
-              'void BootselButtonAddon::setup() {}\n'
-              'void BootselButtonAddon::preprocess() {}\n'
+              '#include "addons/bootsel_button.h"\\n\\n'
+              'bool BootselButtonAddon::available() { return false; }\\n'
+              'void BootselButtonAddon::setup() {}\\n'
+              'void BootselButtonAddon::preprocess() {}\\n'
           )
 
           print("BOOTSEL Switch 2 patch applied successfully")
