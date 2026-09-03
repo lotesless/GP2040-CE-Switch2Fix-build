@@ -1,7 +1,4 @@
-mkdir -p .github/workflows
-
-cat > .github/workflows/build.yml <<'WORKFLOW'
-name: Build GP2040-CE BOOTSEL Macro 2-6
+name: Validate GP2040-CE Build
 
 on:
   workflow_dispatch:
@@ -10,13 +7,13 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   UPSTREAM_REF: v0.7.12
 
 jobs:
-  build:
+  validate:
     runs-on: ubuntu-22.04
 
     steps:
@@ -32,421 +29,57 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20.x'
-          cache: npm
-          cache-dependency-path: gp2040-ce/www/package-lock.json
-
       - name: Setup Raspberry Pi Pico SDK
         uses: Fortinbra/RaspberryPiPicoBuild@v7
 
-      - name: Build web assets
-        working-directory: gp2040-ce/www
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm ci
-          CI=false npm run build
-
-      - name: Verify web filesystem source
+      - name: Verify source files
         working-directory: gp2040-ce
         shell: bash
         run: |
           set -euo pipefail
-          test -f lib/httpd/fsdata.c
-          echo "Found lib/httpd/fsdata.c"
-          wc -c lib/httpd/fsdata.c
-
-      - name: Apply BOOTSEL-only Macro 2 and Macro 6 patch
-        working-directory: gp2040-ce
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PYTHON'
-          from pathlib import Path
-
-          path = Path("src/addons/input_macro.cpp")
-          source = path.read_text()
-          newline = chr(10)
-
-          include_anchor = '#include "hardware/gpio.h"'
-          required_headers = [
-              '#include "hardware/sync.h"',
-              '#include "hardware/regs/io_qspi.h"',
-              '#include "hardware/structs/io_qspi.h"',
-              '#include "hardware/structs/sio.h"',
-          ]
-
-          if include_anchor not in source:
-              raise SystemExit("Cannot find hardware/gpio.h include")
-
-          for header in required_headers:
-              if header not in source:
-                  source = source.replace(
-                      include_anchor,
-                      include_anchor + newline + header,
-                      1,
-                  )
-
-          available_start = source.find("bool InputMacro::available() {")
-          available_end = source.find("void InputMacro::setup() {")
-
-          if available_start < 0 or available_end <= available_start:
-              raise SystemExit("Cannot locate InputMacro::available")
-
-          # The macro addon must remain active even when no GPIO is assigned
-          # to Macro 2 or Macro 6. BOOTSEL is the trigger source.
-          new_available = '''bool InputMacro::available() {
-              return true;
-          }
-
-          '''
-
-          source = (
-              source[:available_start]
-              + new_available
-              + source[available_end:]
-          )
-
-          helper_marker = "namespace {\n          constexpr int BOOTSEL_MACRO_2"
-          setup_marker = "void InputMacro::setup() {"
-
-          helper = '''namespace {
-          // GP2040-CE macro arrays are zero-based:
-          // Macro 2 = index 1, Macro 6 = index 5.
-          constexpr int BOOTSEL_MACRO_2 = 1;
-          constexpr int BOOTSEL_MACRO_6 = 5;
-
-          constexpr uint64_t BOOTSEL_START_DELAY_US = 1000000;
-          constexpr uint64_t BOOTSEL_POLL_INTERVAL_US = 50000;
-          constexpr uint64_t BOOTSEL_DEBOUNCE_US = 30000;
-
-          uint64_t bootselStartedAt = 0;
-          uint64_t bootselLastPollAt = 0;
-          uint64_t bootselChangedAt = 0;
-
-          bool bootselRawPressed = false;
-          bool bootselStablePressed = false;
-          bool bootselPressEvent = false;
-          bool bootselRunOneShot = false;
-
-          // The first BOOTSEL press executes Macro 6.
-          int selectedBootselMacro = BOOTSEL_MACRO_6;
-
-          // RP2040 BOOTSEL shares the QSPI flash CS pin. This function must
-          // execute from SRAM while QSPI CS is temporarily overridden.
-          bool __no_inline_not_in_flash_func(readBootselButton)() {
-              const uint CS_PIN_INDEX = 1;
-              uint32_t interruptState = save_and_disable_interrupts();
-
-              hw_write_masked(
-                  &io_qspi_hw->io[CS_PIN_INDEX].ctrl,
-                  GPIO_OVERRIDE_LOW
-                      << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
-                  IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
-              );
-
-              // Allow the QSPI CS signal to settle.
-              for (volatile int i = 0; i < 1000; ++i) {
-                  __asm volatile("nop");
-              }
-
-              // BOOTSEL is active low.
-              bool pressed =
-                  !(sio_hw->gpio_hi_in & (1u << CS_PIN_INDEX));
-
-              hw_write_masked(
-                  &io_qspi_hw->io[CS_PIN_INDEX].ctrl,
-                  GPIO_OVERRIDE_NORMAL
-                      << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
-                  IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
-              );
-
-              restore_interrupts(interruptState);
-              return pressed;
-          }
-
-          void updateBootselButton() {
-              uint64_t now = getMicro();
-
-              if (bootselStartedAt == 0) {
-                  bootselStartedAt = now;
-                  return;
-              }
-
-              // Do not read BOOTSEL during initial USB startup.
-              if (now - bootselStartedAt < BOOTSEL_START_DELAY_US) {
-                  return;
-              }
-
-              if (now - bootselLastPollAt < BOOTSEL_POLL_INTERVAL_US) {
-                  return;
-              }
-
-              bootselLastPollAt = now;
-              bool rawPressed = readBootselButton();
-
-              if (rawPressed != bootselRawPressed) {
-                  bootselRawPressed = rawPressed;
-                  bootselChangedAt = now;
-              }
-
-              if (now - bootselChangedAt >= BOOTSEL_DEBOUNCE_US &&
-                  bootselRawPressed != bootselStablePressed) {
-                  bootselStablePressed = bootselRawPressed;
-
-                  // Generate exactly one event for each stable press.
-                  // Holding BOOTSEL does not repeatedly execute the macro.
-                  if (bootselStablePressed) {
-                      bootselPressEvent = true;
-                  }
-              }
-          }
-          }
-
-          '''
-
-          if helper_marker not in source:
-              if setup_marker not in source:
-                  raise SystemExit("Cannot find InputMacro::setup marker")
-
-              source = source.replace(
-                  setup_marker,
-                  helper + setup_marker,
-                  1,
-              )
-
-          press_start = source.find("void InputMacro::checkMacroPress() {")
-          press_end = source.find("void InputMacro::checkMacroAction() {")
-
-          if press_start < 0 or press_end <= press_start:
-              raise SystemExit("Cannot locate checkMacroPress")
-
-          new_check_press = '''void InputMacro::checkMacroPress() {
-              updateBootselButton();
-
-              // BOOTSEL is the only macro trigger in this custom mode.
-              // GPIO state, including a permanently grounded GP6, is ignored.
-              pressedMacro = -1;
-
-              if (bootselPressEvent && !isMacroRunning) {
-                  if (inputMacroOptions
-                          ->macroList[selectedBootselMacro]
-                          .enabled) {
-                      pressedMacro = selectedBootselMacro;
-                  }
-              }
-          }
-
-          '''
-
-          source = (
-              source[:press_start]
-              + new_check_press
-              + source[press_end:]
-          )
-
-          action_start = source.find("void InputMacro::checkMacroAction() {")
-          action_end = source.find("void InputMacro::runCurrentMacro() {")
-
-          if action_start < 0 or action_end <= action_start:
-              raise SystemExit("Cannot locate checkMacroAction")
-
-          new_check_action = '''void InputMacro::checkMacroAction() {
-              if (!bootselPressEvent) {
-                  return;
-              }
-
-              // Ignore a BOOTSEL press while a previous macro is running.
-              // The selected macro changes only after a new macro starts.
-              if (isMacroRunning) {
-                  bootselPressEvent = false;
-                  return;
-              }
-
-              bootselPressEvent = false;
-
-              if (pressedMacro == -1) {
-                  return;
-              }
-
-              macroPosition = pressedMacro;
-              macroInputPosition = 0;
-              isMacroTriggerHeld = true;
-              bootselRunOneShot = true;
-
-              Macro& macro =
-                  inputMacroOptions->macroList[macroPosition];
-
-              if (macro.macroInputs_count == 0) {
-                  bootselRunOneShot = false;
-                  reset();
-                  return;
-              }
-
-              MacroInput& macroInput = macro.macroInputs[0];
-              uint32_t macroInputDuration =
-                  macroInput.duration + macroInput.waitDuration;
-
-              macroInputHoldTime =
-                  macroInputDuration <= 0
-                      ? INPUT_HOLD_US
-                      : macroInputDuration;
-
-              isMacroRunning = true;
-              macroStartTime = getMicro();
-              prevMacroInputPressed = false;
-
-              // Alternate only after successfully starting the current macro.
-              selectedBootselMacro =
-                  selectedBootselMacro == BOOTSEL_MACRO_6
-                      ? BOOTSEL_MACRO_2
-                      : BOOTSEL_MACRO_6;
-          }
-
-          '''
-
-          source = (
-              source[:action_start]
-              + new_check_action
-              + source[action_end:]
-          )
-
-          old_completion = '''        if ( macro.macroType == ON_PRESS ) {
-              reset(); // On press = no more macro
-          } else {
-              restart(macro); // On Hold-Repeat or On Toggle = start macro again
-          }'''
-
-          new_completion = '''        if (bootselRunOneShot) {
-              // A BOOTSEL press always runs exactly one complete sequence,
-              // even if the web UI macro type is Hold Repeat or Toggle.
-              bootselRunOneShot = false;
-              reset();
-          } else if ( macro.macroType == ON_PRESS ) {
-              reset(); // On press = no more macro
-          } else {
-              restart(macro); // On Hold-Repeat or On Toggle = start macro again
-          }'''
-
-          if old_completion not in source:
-              raise SystemExit("Cannot locate macro completion block")
-
-          source = source.replace(
-              old_completion,
-              new_completion,
-              1,
-          )
-
-          path.write_text(source)
-
-          print("BOOTSEL-only Macro 2/6 patch applied")
-          print("First BOOTSEL press runs Macro 6")
-          print("Second BOOTSEL press runs Macro 2")
-          print("Later presses continue alternating Macro 6 and Macro 2")
-          print("GP6 is ignored and may remain permanently connected to GND")
-          PYTHON
-
-      - name: Verify generated source
-        working-directory: gp2040-ce
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          grep -n 'hardware/regs/io_qspi.h' src/addons/input_macro.cpp
-          grep -n 'readBootselButton' src/addons/input_macro.cpp
-          grep -n 'selectedBootselMacro' src/addons/input_macro.cpp
-          grep -n 'bootselRunOneShot' src/addons/input_macro.cpp
-          grep -n 'return true;' src/addons/input_macro.cpp
-
-          if grep -nF '\bool' src/addons/input_macro.cpp; then
-            echo 'Invalid literal backslash found before bool'
-            exit 1
-          fi
-
-          if grep -nF '\namespace' src/addons/input_macro.cpp; then
-            echo 'Invalid literal backslash found before namespace'
-            exit 1
-          fi
-
-          echo 'Generated source verification passed'
+          test -f src/addons/input_macro.cpp
+          test -f CMakeLists.txt
+          test -d "$GITHUB_WORKSPACE/pico-sdk"
+          echo "Source and Pico SDK checks passed"
 
       - name: Configure Pico firmware
         working-directory: gp2040-ce
         shell: bash
         run: |
           set -euo pipefail
-
-          test -d "$GITHUB_WORKSPACE/pico-sdk"
-
           export PICO_SDK_PATH="$GITHUB_WORKSPACE/pico-sdk"
           export GP2040_BOARDCONFIG=Pico
           export SKIP_WEBBUILD=TRUE
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
-          cmake \
-            -S . \
-            -B build \
-            -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build Pico UF2
+      - name: Build Pico firmware
         working-directory: gp2040-ce
         shell: bash
         run: |
           set -euo pipefail
           cmake --build build --config Release --parallel 2
 
-      - name: Find and verify UF2
+      - name: Locate UF2
         shell: bash
         run: |
           set -euo pipefail
-
-          UF2_FILE=$(find gp2040-ce/build -type f -name '*.uf2' | head -n 1)
+          UF2_FILE="$(find gp2040-ce/build -type f -name '*.uf2' | head -n 1)"
 
           if [ -z "$UF2_FILE" ]; then
-            echo 'No UF2 file was generated'
+            echo "No UF2 file was generated"
             find gp2040-ce/build -type f | sort
             exit 1
           fi
 
           echo "Generated UF2: $UF2_FILE"
+          cp "$UF2_FILE" GP2040-CE-Pico-validation.uf2
+          sha256sum GP2040-CE-Pico-validation.uf2 > SHA256SUMS.txt
 
-          cp \
-            "$UF2_FILE" \
-            GP2040-CE-Pico-BOOTSEL-Macro2-Macro6.uf2
-
-          sha256sum \
-            GP2040-CE-Pico-BOOTSEL-Macro2-Macro6.uf2 \
-            | tee SHA256SUMS.txt
-
-      - name: Upload UF2 artifact
+      - name: Upload validation artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GP2040-CE-Pico-BOOTSEL-Macro2-Macro6
+          name: GP2040-CE-Pico-validation
           path: |
-            GP2040-CE-Pico-BOOTSEL-Macro2-Macro6.uf2
+            GP2040-CE-Pico-validation.uf2
             SHA256SUMS.txt
           if-no-files-found: error
-
-      - name: Publish GitHub release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          RELEASE_TAG="bootsel-macro-2-6-${GITHUB_RUN_NUMBER}"
-
-          gh release create "$RELEASE_TAG" \
-            GP2040-CE-Pico-BOOTSEL-Macro2-Macro6.uf2 \
-            SHA256SUMS.txt \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "GP2040-CE BOOTSEL Macro 2 and Macro 6" \
-            --notes "GP2040-CE v0.7.12 Pico build. BOOTSEL is the only macro trigger. The first press runs Macro 6, the second press runs Macro 2, and later presses alternate. GP6 may remain grounded but must be unassigned in GPIO Pin Mapping."
-WORKFLOW
-
-git add .github/workflows/build.yml
-git commit -m "Implement BOOTSEL-only Macro 2 and Macro 6 trigger"
-git push origin main
