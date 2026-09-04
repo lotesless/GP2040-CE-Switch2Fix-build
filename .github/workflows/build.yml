@@ -1,4 +1,4 @@
-name: Build GP2040-CE v0.7.12 Switch 2 Fix Auto A
+name: Build GP2040-CE v0.7.12 Switch 2 Fix Direct BOOTSEL
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
       - name: Checkout build repository
         uses: actions/checkout@v4
 
-      - name: Checkout GP2040-CE source
+      - name: Checkout official GP2040-CE source
         uses: actions/checkout@v4
         with:
           repository: OpenStickCommunity/GP2040-CE
@@ -47,7 +47,7 @@ jobs:
           test -d "$GITHUB_WORKSPACE/pico-sdk"
           test -f "$GITHUB_WORKSPACE/pico-sdk/pico_sdk_init.cmake"
 
-          echo "Pico SDK found at:"
+          echo "Pico SDK verified:"
           echo "$GITHUB_WORKSPACE/pico-sdk"
 
       - name: Build web assets
@@ -67,9 +67,10 @@ jobs:
 
           test -f lib/httpd/fsdata.c
 
-          echo "fsdata.c generated successfully"
+          echo "Generated web filesystem:"
+          ls -lh lib/httpd/fsdata.c
 
-      - name: Apply Switch 2 fix and automatic A patch
+      - name: Apply direct BOOTSEL macro and automatic A patch
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -92,18 +93,22 @@ jobs:
                   "src/addons/bootsel_button.cpp was not found"
               )
 
-          macro_source = macro_file.read_text(
+          source = macro_file.read_text(
               encoding="utf-8"
           )
 
-          # Normalize line endings so generated patches are predictable.
-          macro_source = macro_source.replace(
+          source = source.replace(
               "\r\n",
               "\n",
           ).replace(
               "\r",
               "\n",
           )
+
+          if "namespace Switch2FixSupport" in source:
+              raise SystemExit(
+                  "Switch2FixSupport was already inserted"
+              )
 
           gpio_include = '#include "hardware/gpio.h"'
 
@@ -113,15 +118,15 @@ jobs:
               '#include "hardware/structs/sio.h"',
           ]
 
-          if gpio_include not in macro_source:
+          if gpio_include not in source:
               raise SystemExit(
-                  "Cannot find hardware/gpio.h include"
+                  "hardware/gpio.h include was not found"
               )
 
           missing_includes = [
               include_line
               for include_line in required_includes
-              if include_line not in macro_source
+              if include_line not in source
           ]
 
           if missing_includes:
@@ -131,16 +136,59 @@ jobs:
                   + "\n".join(missing_includes)
               )
 
-              macro_source = macro_source.replace(
+              source = source.replace(
                   gpio_include,
                   include_block,
                   1,
               )
 
-          helper_marker = "namespace Switch2FixSupport"
+          available_pattern = re.compile(
+              r"bool\s+InputMacro::available\s*"
+              r"\(\s*\)\s*\{.*?^\}",
+              re.MULTILINE | re.DOTALL,
+          )
+
+          available_matches = list(
+              available_pattern.finditer(source)
+          )
+
+          if len(available_matches) != 1:
+              raise SystemExit(
+                  "Expected exactly one "
+                  "InputMacro::available(), "
+                  f"found {len(available_matches)}"
+              )
+
+          new_available = '''bool InputMacro::available() {
+              // BOOTSEL and automatic A require this addon
+              // to remain active regardless of GPIO state.
+              return true;
+          }'''
+
+          source = available_pattern.sub(
+              new_available,
+              source,
+              count=1,
+          )
+
+          setup_pattern = re.compile(
+              r"^[ \t]*void\s+InputMacro::setup\s*"
+              r"\(\s*\)\s*\{",
+              re.MULTILINE,
+          )
+
+          setup_match = setup_pattern.search(source)
+
+          if setup_match is None:
+              raise SystemExit(
+                  "InputMacro::setup() was not found"
+              )
 
           helper_code = r'''
           namespace Switch2FixSupport {
+
+          constexpr int MACRO_2_INDEX = 1;
+          constexpr int MACRO_6_INDEX = 5;
 
           constexpr uint64_t BOOTSEL_START_DELAY_US =
               1000000;
@@ -150,9 +198,6 @@ jobs:
 
           constexpr uint64_t BOOTSEL_DEBOUNCE_US =
               30000;
-
-          constexpr int MACRO_2_INDEX = 1;
-          constexpr int MACRO_6_INDEX = 5;
 
           constexpr uint64_t AUTO_A_START_DELAY_US =
               2000000;
@@ -169,11 +214,12 @@ jobs:
           uint64_t bootselLastPollTime = 0;
           uint64_t bootselChangedTime = 0;
 
-          bool bootselRawState = false;
-          bool bootselStableState = false;
+          bool bootselRawPressed = false;
+          bool bootselStablePressed = false;
+          bool bootselPressEvent = false;
 
-          int nextMacroIndex = MACRO_6_INDEX;
-          int pendingMacroIndex = -1;
+          int selectedMacroIndex =
+              MACRO_6_INDEX;
 
           uint64_t autoAStartTime = 0;
           int autoAPressCount = 0;
@@ -217,9 +263,7 @@ jobs:
               return pressed;
           }
 
-          void updateBootselMacroSelector(
-              bool acceptNewPress
-          ) {
+          void updateBootselButton() {
               uint64_t now = getMicro();
 
               if (bootselStartTime == 0) {
@@ -245,41 +289,52 @@ jobs:
 
               bootselLastPollTime = now;
 
-              bool rawState =
+              bool rawPressed =
                   readBootselButton();
 
-              if (rawState != bootselRawState) {
-                  bootselRawState = rawState;
+              if (
+                  rawPressed !=
+                  bootselRawPressed
+              ) {
+                  bootselRawPressed =
+                      rawPressed;
+
                   bootselChangedTime = now;
               }
 
               if (
-                  rawState != bootselStableState &&
+                  bootselRawPressed !=
+                      bootselStablePressed &&
                   now - bootselChangedTime >=
                       BOOTSEL_DEBOUNCE_US
               ) {
-                  bootselStableState = rawState;
+                  bootselStablePressed =
+                      bootselRawPressed;
 
-                  if (
-                      bootselStableState &&
-                      acceptNewPress
-                  ) {
-                      pendingMacroIndex =
-                          nextMacroIndex;
-
-                      nextMacroIndex =
-                          nextMacroIndex ==
-                              MACRO_6_INDEX
-                              ? MACRO_2_INDEX
-                              : MACRO_6_INDEX;
+                  if (bootselStablePressed) {
+                      bootselPressEvent = true;
                   }
               }
           }
 
-          int takePendingMacroIndex() {
-              int result = pendingMacroIndex;
-              pendingMacroIndex = -1;
-              return result;
+          bool hasBootselPressEvent() {
+              return bootselPressEvent;
+          }
+
+          void discardBootselPressEvent() {
+              bootselPressEvent = false;
+          }
+
+          int getSelectedMacroIndex() {
+              return selectedMacroIndex;
+          }
+
+          void selectNextMacro() {
+              selectedMacroIndex =
+                  selectedMacroIndex ==
+                      MACRO_6_INDEX
+                      ? MACRO_2_INDEX
+                      : MACRO_6_INDEX;
           }
 
           void runAutomaticASequence(
@@ -331,111 +386,241 @@ jobs:
           }
           '''
 
-          if helper_marker in macro_source:
-              raise SystemExit(
-                  "Switch2FixSupport was already inserted"
-              )
-
-          available_pattern = re.compile(
-              r"^[ \t]*bool[ \t]+"
-              r"InputMacro::available[ \t]*"
-              r"\([ \t]*\)",
-              re.MULTILINE,
-          )
-
-          available_match = available_pattern.search(
-              macro_source
-          )
-
-          if available_match is None:
-              raise SystemExit(
-                  "InputMacro::available() was not found"
-              )
-
-          macro_source = (
-              macro_source[:available_match.start()]
+          source = (
+              source[:setup_match.start()]
               + helper_code.strip()
               + "\n\n"
-              + macro_source[available_match.start():]
+              + source[setup_match.start():]
           )
 
-          # Insert the BOOTSEL virtual macro trigger immediately
-          # after the official allPins declaration. The original
-          # macro loop and runCurrentMacro() remain unchanged.
-          all_pins_pattern = re.compile(
-              r"^(?P<indent>[ \t]*)"
-              r"Mask_t[ \t]+allPins[ \t]*="
-              r"[ \t]*gamepad->debouncedGpio"
-              r"[ \t]*;[ \t]*\n",
+          check_press_start_pattern = re.compile(
+              r"^[ \t]*void\s+"
+              r"InputMacro::checkMacroPress\s*"
+              r"\(\s*\)\s*\{",
               re.MULTILINE,
           )
 
-          all_pins_matches = list(
-              all_pins_pattern.finditer(macro_source)
+          check_action_start_pattern = re.compile(
+              r"^[ \t]*void\s+"
+              r"InputMacro::checkMacroAction\s*"
+              r"\(\s*\)\s*\{",
+              re.MULTILINE,
           )
 
-          if len(all_pins_matches) != 1:
+          check_press_match = (
+              check_press_start_pattern.search(source)
+          )
+
+          check_action_match = (
+              check_action_start_pattern.search(source)
+          )
+
+          if check_press_match is None:
               raise SystemExit(
-                  "Expected exactly one allPins declaration "
-                  "inside InputMacro::checkMacroPress(), "
-                  f"found {len(all_pins_matches)}"
+                  "InputMacro::checkMacroPress() "
+                  "was not found"
               )
 
-          all_pins_match = all_pins_matches[0]
-          body_indent = all_pins_match.group("indent")
+          if check_action_match is None:
+              raise SystemExit(
+                  "InputMacro::checkMacroAction() "
+                  "was not found"
+              )
 
-          bootsel_trigger_block = (
-              f"{body_indent}"
-              "Switch2FixSupport::"
-              "updateBootselMacroSelector("
-              "!isMacroRunning);\n"
-              "\n"
-              f"{body_indent}"
-              "const int bootselMacroIndex =\n"
-              f"{body_indent}    "
-              "Switch2FixSupport::"
-              "takePendingMacroIndex();\n"
-              "\n"
-              f"{body_indent}"
-              "if (\n"
-              f"{body_indent}    "
-              "bootselMacroIndex >= 0 &&\n"
-              f"{body_indent}    "
-              "bootselMacroIndex < MAX_MACRO_LIMIT &&\n"
-              f"{body_indent}    "
-              "macroPinMasks[bootselMacroIndex] != 0\n"
-              f"{body_indent}"
-              ") {\n"
-              f"{body_indent}    "
-              "allPins |= "
-              "macroPinMasks[bootselMacroIndex];\n"
-              f"{body_indent}"
-              "}\n"
+          if (
+              check_action_match.start() <=
+              check_press_match.start()
+          ):
+              raise SystemExit(
+                  "Unexpected macro function order"
+              )
+
+          new_check_press = '''void InputMacro::checkMacroPress() {
+              Switch2FixSupport::updateBootselButton();
+
+              pressedMacro = -1;
+
+              if (
+                  !Switch2FixSupport::
+                      hasBootselPressEvent()
+              ) {
+                  return;
+              }
+
+              if (isMacroRunning) {
+                  Switch2FixSupport::
+                      discardBootselPressEvent();
+
+                  return;
+              }
+
+              const int candidateMacro =
+                  Switch2FixSupport::
+                      getSelectedMacroIndex();
+
+              if (
+                  candidateMacro < 0 ||
+                  candidateMacro >=
+                      MAX_MACRO_LIMIT
+              ) {
+                  Switch2FixSupport::
+                      discardBootselPressEvent();
+
+                  return;
+              }
+
+              Macro& macro =
+                  inputMacroOptions
+                      ->macroList[candidateMacro];
+
+              if (
+                  !macro.enabled ||
+                  macro.macroInputs_count == 0
+              ) {
+                  Switch2FixSupport::
+                      discardBootselPressEvent();
+
+                  return;
+              }
+
+              pressedMacro = candidateMacro;
+          }
+
+          '''
+
+          source = (
+              source[:check_press_match.start()]
+              + new_check_press
+              + source[check_action_match.start():]
           )
 
-          insertion_position = all_pins_match.end()
-
-          macro_source = (
-              macro_source[:insertion_position]
-              + "\n"
-              + bootsel_trigger_block
-              + macro_source[insertion_position:]
+          check_action_match = (
+              check_action_start_pattern.search(source)
           )
 
-          # Insert automatic A at the start of preprocess().
-          # This keeps the official checkMacroPress(),
-          # checkMacroAction(), and runCurrentMacro() sequence.
+          run_current_pattern = re.compile(
+              r"^[ \t]*void\s+"
+              r"InputMacro::runCurrentMacro\s*"
+              r"\(\s*\)\s*\{",
+              re.MULTILINE,
+          )
+
+          run_current_match = (
+              run_current_pattern.search(source)
+          )
+
+          if check_action_match is None:
+              raise SystemExit(
+                  "InputMacro::checkMacroAction() "
+                  "was lost during patching"
+              )
+
+          if run_current_match is None:
+              raise SystemExit(
+                  "InputMacro::runCurrentMacro() "
+                  "was not found"
+              )
+
+          if (
+              run_current_match.start() <=
+              check_action_match.start()
+          ):
+              raise SystemExit(
+                  "Unexpected checkMacroAction/"
+                  "runCurrentMacro order"
+              )
+
+          original_run_current_and_after = (
+              source[run_current_match.start():]
+          )
+
+          new_check_action = '''void InputMacro::checkMacroAction() {
+              if (
+                  !Switch2FixSupport::
+                      hasBootselPressEvent()
+              ) {
+                  return;
+              }
+
+              Switch2FixSupport::
+                  discardBootselPressEvent();
+
+              if (
+                  isMacroRunning ||
+                  pressedMacro < 0 ||
+                  pressedMacro >=
+                      MAX_MACRO_LIMIT
+              ) {
+                  pressedMacro = -1;
+                  return;
+              }
+
+              macroPosition = pressedMacro;
+              macroInputPosition = 0;
+              isMacroTriggerHeld = true;
+              prevMacroInputPressed = false;
+
+              Macro& macro =
+                  inputMacroOptions
+                      ->macroList[macroPosition];
+
+              if (
+                  !macro.enabled ||
+                  macro.macroInputs_count == 0
+              ) {
+                  reset();
+                  return;
+              }
+
+              // A BOOTSEL press always executes one sequence.
+              // This prevents Toggle or Hold Repeat settings
+              // from keeping the macro active indefinitely.
+              macro.macroType = ON_PRESS;
+
+              MacroInput& macroInput =
+                  macro.macroInputs[0];
+
+              uint32_t macroInputDuration =
+                  macroInput.duration +
+                  macroInput.waitDuration;
+
+              macroInputHoldTime =
+                  macroInputDuration <= 0
+                      ? INPUT_HOLD_US
+                      : macroInputDuration;
+
+              isMacroRunning = true;
+              macroStartTime = getMicro();
+
+              Switch2FixSupport::
+                  selectNextMacro();
+          }
+
+          '''
+
+          source = (
+              source[:check_action_match.start()]
+              + new_check_action
+              + source[run_current_match.start():]
+          )
+
+          if original_run_current_and_after not in source:
+              raise SystemExit(
+                  "Official runCurrentMacro() content "
+                  "was unexpectedly modified"
+              )
+
           preprocess_pattern = re.compile(
               r"^(?P<indent>[ \t]*)"
-              r"void[ \t]+InputMacro::preprocess"
-              r"[ \t]*\([ \t]*\)[ \t]*"
+              r"void\s+InputMacro::preprocess\s*"
+              r"\(\s*\)\s*"
               r"(?:\n[ \t]*)?"
               r"\{[ \t]*\n",
               re.MULTILINE,
           )
 
           preprocess_matches = list(
-              preprocess_pattern.finditer(macro_source)
+              preprocess_pattern.finditer(source)
           )
 
           if len(preprocess_matches) != 1:
@@ -446,49 +631,44 @@ jobs:
               )
 
           preprocess_match = preprocess_matches[0]
-          preprocess_body_indent = (
+
+          body_indent = (
               preprocess_match.group("indent")
               + "    "
           )
 
           auto_a_block = (
-              f"{preprocess_body_indent}"
+              f"{body_indent}"
               "Gamepad* switch2FixGamepad =\n"
-              f"{preprocess_body_indent}    "
+              f"{body_indent}    "
               "Storage::getInstance().GetGamepad();\n"
               "\n"
-              f"{preprocess_body_indent}"
+              f"{body_indent}"
               "Switch2FixSupport::"
               "runAutomaticASequence(\n"
-              f"{preprocess_body_indent}    "
+              f"{body_indent}    "
               "switch2FixGamepad\n"
-              f"{preprocess_body_indent}"
+              f"{body_indent}"
               ");\n"
+              "\n"
           )
 
-          preprocess_insertion_position = (
+          insertion_position = (
               preprocess_match.end()
           )
 
-          macro_source = (
-              macro_source[
-                  :preprocess_insertion_position
-              ]
+          source = (
+              source[:insertion_position]
               + auto_a_block
-              + "\n"
-              + macro_source[
-                  preprocess_insertion_position:
-              ]
+              + source[insertion_position:]
           )
 
           macro_file.write_text(
-              macro_source,
+              source,
               encoding="utf-8",
               newline="\n",
           )
 
-          # Disable the original BOOTSEL addon because BOOTSEL
-          # is now sampled from input_macro.cpp.
           disabled_bootsel_source = '''\
           #include "addons/bootsel_button.h"
 
@@ -509,20 +689,30 @@ jobs:
               newline="\n",
           )
 
-          print("Switch 2 patch applied successfully")
-          print("Original runCurrentMacro() was preserved")
-          print("First BOOTSEL press selects Macro 6")
-          print("Second BOOTSEL press selects Macro 2")
-          print("BOOTSEL start delay: 1000 ms")
-          print("BOOTSEL poll interval: 20 ms")
-          print("BOOTSEL debounce: 30 ms")
-          print("Automatic A start delay: 2000 ms")
-          print("Automatic A press count: 3")
-          print("Automatic A interval: 500 ms")
-          print("Automatic A hold duration: 120 ms")
+          print(
+              "Direct BOOTSEL macro patch applied"
+          )
+          print(
+              "InputMacro addon is forced available"
+          )
+          print(
+              "First BOOTSEL press: Macro 6"
+          )
+          print(
+              "Second BOOTSEL press: Macro 2"
+          )
+          print(
+              "Original runCurrentMacro() preserved"
+          )
+          print(
+              "Automatic A starts after 2000 ms"
+          )
+          print(
+              "Automatic A count: 3"
+          )
           PY
 
-      - name: Verify patched source
+      - name: Verify patched C++ source
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -542,30 +732,64 @@ jobs:
 
           test "$(
             grep -c \
-              "readBootselButton" \
+              "bool InputMacro::available" \
               "$INPUT_MACRO_FILE"
-          )" -ge 2
+          )" -eq 1
 
           test "$(
             grep -c \
-              "updateBootselMacroSelector" \
+              "void InputMacro::checkMacroPress" \
               "$INPUT_MACRO_FILE"
-          )" -ge 2
+          )" -eq 1
 
           test "$(
             grep -c \
-              "runAutomaticASequence" \
+              "void InputMacro::checkMacroAction" \
               "$INPUT_MACRO_FILE"
-          )" -ge 2
+          )" -eq 1
 
           test "$(
             grep -c \
-              "InputMacro::runCurrentMacro" \
+              "void InputMacro::runCurrentMacro" \
+              "$INPUT_MACRO_FILE"
+          )" -eq 1
+
+          test "$(
+            grep -c \
+              "void InputMacro::preprocess" \
               "$INPUT_MACRO_FILE"
           )" -eq 1
 
           grep -q \
+            "readBootselButton" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "save_and_disable_interrupts" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
             "restore_interrupts(flags)" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "BOOTSEL_START_DELAY_US" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "BOOTSEL_POLL_INTERVAL_US" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "BOOTSEL_DEBOUNCE_US" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "selectedMacroIndex" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "MACRO_2_INDEX = 1" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
@@ -573,7 +797,7 @@ jobs:
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "MACRO_2_INDEX = 1" \
+            "macro.macroType = ON_PRESS" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
@@ -589,11 +813,11 @@ jobs:
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "GAMEPAD_MASK_B1" \
+            "AUTO_A_PRESS_COUNT" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "macroPinMasks\[bootselMacroIndex\]" \
+            "GAMEPAD_MASK_B1" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
@@ -612,6 +836,13 @@ jobs:
           fi
 
           if grep -q \
+            "allPins |= macroPinMasks" \
+            "$INPUT_MACRO_FILE"; then
+            echo "Old virtual GPIO trigger logic found"
+            exit 1
+          fi
+
+          if grep -q \
             "InputMacro trigger block not found" \
             "$INPUT_MACRO_FILE"; then
             echo "Old failed patch text found"
@@ -621,22 +852,38 @@ jobs:
           echo "Patched source verification passed"
 
           echo
-          echo "Patched checkMacroPress section:"
+          echo "InputMacro availability:"
           grep \
             -n \
-            -A 32 \
-            -B 4 \
-            "updateBootselMacroSelector" \
+            -A 8 \
+            "bool InputMacro::available" \
             "$INPUT_MACRO_FILE"
 
           echo
-          echo "Patched preprocess section:"
+          echo "Direct BOOTSEL checkMacroPress:"
           grep \
             -n \
-            -A 24 \
-            -B 4 \
-            "runAutomaticASequence" \
+            -A 70 \
+            "void InputMacro::checkMacroPress" \
             "$INPUT_MACRO_FILE"
+
+          echo
+          echo "Direct BOOTSEL checkMacroAction:"
+          grep \
+            -n \
+            -A 85 \
+            "void InputMacro::checkMacroAction" \
+            "$INPUT_MACRO_FILE"
+
+          echo
+          echo "Automatic A preprocess call:"
+          grep \
+            -n \
+            -A 18 \
+            -B 5 \
+            "runAutomaticASequence" \
+            "$INPUT_MACRO_FILE" \
+            | tail -n 30
 
       - name: Configure Pico firmware
         working-directory: gp2040-ce
@@ -673,15 +920,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          mapfile -t UF2_FILES < <(
-            find gp2040-ce/build \
-              -type f \
-              -name "*.uf2" \
-              | sort
-          )
+          EXPECTED_UF2="gp2040-ce/build/GP2040-CE_0.7.12_Pico.uf2"
 
-          if [ "${#UF2_FILES[@]}" -eq 0 ]; then
-            echo "No UF2 files were generated"
+          if [ -f "$EXPECTED_UF2" ]; then
+            UF2_FILE="$EXPECTED_UF2"
+          else
+            UF2_FILE="$(
+              find gp2040-ce/build \
+                -type f \
+                -name "GP2040-CE_*_Pico.uf2" \
+                | sort \
+                | head -n 1
+            )"
+          fi
+
+          if [ -z "${UF2_FILE:-}" ]; then
+            echo "Pico UF2 file was not generated"
 
             find gp2040-ce/build \
               -maxdepth 4 \
@@ -691,26 +945,8 @@ jobs:
             exit 1
           fi
 
-          printf '%s\n' "${UF2_FILES[@]}"
-
-          UF2_FILE=""
-
-          for candidate in "${UF2_FILES[@]}"; do
-            candidate_name="$(
-              basename "$candidate"
-            )"
-
-            if [[ "$candidate_name" == *Pico*.uf2 ]]; then
-              UF2_FILE="$candidate"
-              break
-            fi
-          done
-
-          if [ -z "$UF2_FILE" ]; then
-            UF2_FILE="${UF2_FILES[0]}"
-          fi
-
           test -f "$UF2_FILE"
+          test -s "$UF2_FILE"
 
           echo "UF2_FILE=$UF2_FILE" \
             >> "$GITHUB_ENV"
@@ -718,7 +954,7 @@ jobs:
           echo "Selected UF2:"
           echo "$UF2_FILE"
 
-      - name: Package UF2
+      - name: Package direct BOOTSEL firmware
         shell: bash
         run: |
           set -euo pipefail
@@ -726,7 +962,7 @@ jobs:
           test -n "${UF2_FILE:-}"
           test -f "$UF2_FILE"
 
-          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-Fix-AutoA.uf2"
+          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-Direct-BOOTSEL-AutoA.uf2"
 
           cp \
             "$UF2_FILE" \
@@ -743,14 +979,15 @@ jobs:
             "$OUTPUT_FILE" \
             SHA256SUMS.txt
 
+          echo
           cat SHA256SUMS.txt
 
       - name: Upload UF2 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GP2040-CE-v0.7.12-Switch2-Fix-AutoA
+          name: GP2040-CE-v0.7.12-Switch2-Direct-BOOTSEL-AutoA
           path: |
-            GP2040-CE-v0.7.12-Switch2-Fix-AutoA.uf2
+            GP2040-CE-v0.7.12-Switch2-Direct-BOOTSEL-AutoA.uf2
             SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
