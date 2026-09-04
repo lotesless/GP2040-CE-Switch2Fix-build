@@ -1,4 +1,4 @@
-name: Build GP2040-CE BOOTSEL Macro 2-6
+name: Build Official GP2040-CE Pico
 
 on:
   workflow_dispatch:
@@ -39,458 +39,37 @@ jobs:
       - name: Setup Raspberry Pi Pico SDK
         uses: Fortinbra/RaspberryPiPicoBuild@v7
 
-      - name: Build web assets
+      - name: Build official web assets
         working-directory: gp2040-ce/www
         shell: bash
         run: |
           set -euo pipefail
+
           npm ci
           CI=false npm run build
 
-      - name: Verify web filesystem
+      - name: Verify official web filesystem
         working-directory: gp2040-ce
         shell: bash
         run: |
           set -euo pipefail
+
           test -f lib/httpd/fsdata.c
-          echo "fsdata.c generated successfully"
 
-      - name: Apply BOOTSEL macro bridge patch
-        working-directory: gp2040-ce
-        shell: bash
-        run: |
-          set -euo pipefail
+          echo "Official fsdata.c exists"
 
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("src/addons/bootsel_button.cpp")
-          source = path.read_text()
-
-          required_includes = [
-              '#include "addons/bootsel_button.h"',
-              '#include "storagemanager.h"',
-              '#include "hardware/gpio.h"',
-              '#include "hardware/sync.h"',
-              '#include "hardware/structs/ioqspi.h"',
-              '#include "hardware/structs/sio.h"',
-              '#include "helper.h"',
-              '#include "config.pb.h"',
-          ]
-
-          namespace_name = "namespace BootselMacroBridge"
-
-          def remove_namespace_block(text, namespace_marker):
-              start = text.find(namespace_marker)
-
-              if start < 0:
-                  return text
-
-              opening_brace = text.find("{", start)
-
-              if opening_brace < 0:
-                  raise SystemExit(
-                      "Cannot find old BOOTSEL namespace opening brace"
-                  )
-
-              depth = 0
-              end = -1
-
-              for index in range(
-                  opening_brace,
-                  len(text),
-              ):
-                  character = text[index]
-
-                  if character == "{":
-                      depth += 1
-
-                  elif character == "}":
-                      depth -= 1
-
-                      if depth == 0:
-                          end = index + 1
-                          break
-
-              if end < 0:
-                  raise SystemExit(
-                      "Cannot find old BOOTSEL namespace closing brace"
-                  )
-
-              while end < len(text):
-                  if text[end] in " \t\r\n":
-                      end += 1
-                  else:
-                      break
-
-              return text[:start] + text[end:]
-
-          def remove_include_lines(text, include_lines):
-              lines = text.splitlines()
-              filtered = []
-
-              for line in lines:
-                  if line.strip() in include_lines:
-                      continue
-                  filtered.append(line)
-
-              return "\n".join(filtered)
-
-          def find_function_end(text, signature):
-              start = text.find(signature)
-
-              if start < 0:
-                  raise SystemExit(
-                      "Cannot find function: " + signature
-                  )
-
-              opening_brace = text.find("{", start)
-
-              if opening_brace < 0:
-                  raise SystemExit(
-                      "Cannot find opening brace: " + signature
-                  )
-
-              depth = 0
-
-              for index in range(
-                  opening_brace,
-                  len(text),
-              ):
-                  character = text[index]
-
-                  if character == "{":
-                      depth += 1
-
-                  elif character == "}":
-                      depth -= 1
-
-                      if depth == 0:
-                          return start, index + 1
-
-              raise SystemExit(
-                  "Cannot find closing brace: " + signature
-              )
-
-          def replace_function(text, signature, replacement):
-              start, end = find_function_end(
-                  text,
-                  signature,
-              )
-
-              return (
-                  text[:start] +
-                  replacement.strip() +
-                  text[end:]
-              )
-
-          # 删除旧版本可能已经插入的命名空间。
-          source = remove_namespace_block(
-              source,
-              namespace_name,
-          )
-
-          # 删除旧版本插入的依赖头文件。
-          include_set = set(required_includes)
-          source = remove_include_lines(
-              source,
-              include_set,
-          )
-
-          # 自定义代码。注意：此代码放在所有 include 之后。
-          namespace_code = r'''
-          namespace BootselMacroBridge {
-
-          constexpr uint32_t MACRO_2_GPIO_MASK =
-              1u << 6;
-
-          constexpr uint32_t MACRO_6_GPIO_MASK =
-              1u << 7;
-
-          constexpr uint64_t START_DELAY_US =
-              1000000;
-
-          constexpr uint64_t POLL_INTERVAL_US =
-              50000;
-
-          constexpr uint64_t DEBOUNCE_US =
-              30000;
-
-          uint64_t startedAt = 0;
-          uint64_t lastPollAt = 0;
-          uint64_t changedAt = 0;
-
-          bool rawPressed = false;
-          bool stablePressed = false;
-
-          // First BOOTSEL press selects Macro 6.
-          uint32_t activeMacroMask =
-              MACRO_6_GPIO_MASK;
-
-          bool __no_inline_not_in_flash_func(
-              readBootselForMacro
-          )() {
-              const uint CS_PIN_INDEX = 1;
-
-              uint32_t flags =
-                  save_and_disable_interrupts();
-
-              hw_write_masked(
-                  &ioqspi_hw
-                      ->io[CS_PIN_INDEX]
-                      .ctrl,
-                  GPIO_OVERRIDE_LOW
-                      << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
-                  IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
-              );
-
-              for (volatile int i = 0; i < 1000; ++i) {
-                  __asm volatile("nop");
-              }
-
-              // BOOTSEL is active low.
-              bool pressed =
-                  !(sio_hw->gpio_hi_in &
-                    (1u << CS_PIN_INDEX));
-
-              hw_write_masked(
-                  &ioqspi_hw
-                      ->io[CS_PIN_INDEX]
-                      .ctrl,
-                  GPIO_OVERRIDE_NORMAL
-                      << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
-                  IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
-              );
-
-              restore_interrupts(flags);
-
-              return pressed;
-          }
-
-          void update() {
-              uint64_t now = getMicro();
-
-              if (startedAt == 0) {
-                  startedAt = now;
-                  changedAt = now;
-                  return;
-              }
-
-              // Do not read BOOTSEL during startup.
-              if (
-                  now - startedAt <
-                  START_DELAY_US
-              ) {
-                  return;
-              }
-
-              if (
-                  now - lastPollAt <
-                  POLL_INTERVAL_US
-              ) {
-                  return;
-              }
-
-              lastPollAt = now;
-
-              bool currentRaw =
-                  readBootselForMacro();
-
-              if (currentRaw != rawPressed) {
-                  rawPressed = currentRaw;
-                  changedAt = now;
-              }
-
-              if (
-                  now - changedAt >=
-                      DEBOUNCE_US &&
-                  rawPressed != stablePressed
-              ) {
-                  stablePressed = rawPressed;
-
-                  // Switch macro after BOOTSEL release.
-                  //
-                  // First press  = Macro 6
-                  // Second press = Macro 2
-                  if (!stablePressed) {
-                      if (
-                          activeMacroMask ==
-                          MACRO_6_GPIO_MASK
-                      ) {
-                          activeMacroMask =
-                              MACRO_2_GPIO_MASK;
-                      } else {
-                          activeMacroMask =
-                              MACRO_6_GPIO_MASK;
-                      }
-                  }
-              }
-          }
-
-          void applyVirtualMacroPin(
-              Gamepad* gamepad
-          ) {
-              const uint32_t bothMacroMasks =
-                  MACRO_2_GPIO_MASK |
-                  MACRO_6_GPIO_MASK;
-
-              // Remove physical GP6 and GP7 states.
-              gamepad->debouncedGpio &=
-                  ~bothMacroMasks;
-
-              // Expose exactly one virtual macro pin.
-              if (stablePressed) {
-                  gamepad->debouncedGpio |=
-                      activeMacroMask;
-              }
-          }
-
-          }
-          '''
-
-          # 把官方 include 放到源码最顶部。
-          include_block = "\n".join(
-              required_includes
-          )
-
-          # 将自定义命名空间放在所有 include 之后。
-          source = (
-              include_block +
-              "\n\n" +
-              namespace_code.strip() +
-              "\n\n" +
-              source.lstrip()
-          )
-
-          new_available = r'''
-          bool BootselButtonAddon::available() {
-              // Always load this addon so the BOOTSEL
-              // macro bridge is active.
-              return true;
-          }
-          '''
-
-          new_setup = r'''
-          void BootselButtonAddon::setup() {
-              const BootselButtonOptions& options =
-                  Storage::getInstance()
-                      .getAddonOptions()
-                      .bootselButtonOptions;
-
-              // Preserve the official BOOTSEL mapping.
-              bootselButtonMap =
-                  options.buttonMap;
-          }
-          '''
-
-          new_preprocess = r'''
-          void BootselButtonAddon::preprocess() {
-              Gamepad* gamepad =
-                  Storage::getInstance()
-                      .GetGamepad();
-
-              BootselMacroBridge::update();
-
-              // Preserve the official BOOTSEL button
-              // behavior when a button map is configured.
-              if (
-                  BootselMacroBridge::stablePressed &&
-                  bootselButtonMap != 0
-              ) {
-                  switch (bootselButtonMap) {
-                      case GAMEPAD_MASK_DU:
-                          gamepad->state.dpad |=
-                              GAMEPAD_MASK_UP;
-                          break;
-
-                      case GAMEPAD_MASK_DD:
-                          gamepad->state.dpad |=
-                              GAMEPAD_MASK_DOWN;
-                          break;
-
-                      case GAMEPAD_MASK_DL:
-                          gamepad->state.dpad |=
-                              GAMEPAD_MASK_LEFT;
-                          break;
-
-                      case GAMEPAD_MASK_DR:
-                          gamepad->state.dpad |=
-                              GAMEPAD_MASK_RIGHT;
-                          break;
-
-                      default:
-                          gamepad->state.buttons |=
-                              bootselButtonMap;
-                          break;
-                  }
-              }
-
-              // Expose BOOTSEL as a virtual macro pin.
-              BootselMacroBridge::applyVirtualMacroPin(
-                  gamepad
-              );
-          }
-          '''
-
-          source = replace_function(
-              source,
-              "bool BootselButtonAddon::available()",
-              new_available,
-          )
-
-          source = replace_function(
-              source,
-              "void BootselButtonAddon::setup()",
-              new_setup,
-          )
-
-          source = replace_function(
-              source,
-              "void BootselButtonAddon::preprocess()",
-              new_preprocess,
-          )
-
-          path.write_text(source)
-
-          print(
-              "BOOTSEL macro bridge patch applied successfully"
-          )
-          print(
-              "All required includes were moved to the top"
-          )
-          print(
-              "Official input_macro.cpp remains unchanged"
-          )
-          print(
-              "First BOOTSEL press selects Macro 6"
-          )
-          print(
-              "Second BOOTSEL press selects Macro 2"
-          )
-          PY
-
-      - name: Verify BOOTSEL source order
+      - name: Verify official source is unmodified
         working-directory: gp2040-ce
         shell: bash
         run: |
           set -euo pipefail
 
           test -f src/addons/bootsel_button.cpp
+          test -f src/addons/input_macro.cpp
+          test -f headers/addons/bootsel_button.h
 
           grep -q \
-            "namespace BootselMacroBridge" \
-            src/addons/bootsel_button.cpp
-
-          grep -q \
-            "MACRO_2_GPIO_MASK" \
-            src/addons/bootsel_button.cpp
-
-          grep -q \
-            "MACRO_6_GPIO_MASK" \
-            src/addons/bootsel_button.cpp
-
-          grep -q \
-            "readBootselForMacro" \
+            "BootselButtonAddon::isBootselPressed" \
             src/addons/bootsel_button.cpp
 
           grep -q \
@@ -498,88 +77,26 @@ jobs:
             src/addons/bootsel_button.cpp
 
           grep -q \
-            "applyVirtualMacroPin" \
-            src/addons/bootsel_button.cpp
+            "InputMacro::runCurrentMacro" \
+            src/addons/input_macro.cpp
 
-          grep -q \
-            '#include "hardware/sync.h"' \
-            src/addons/bootsel_button.cpp
+          if grep -q \
+            "BootselMacroBridge" \
+            src/addons/bootsel_button.cpp; then
+            echo "Unexpected custom BOOTSEL patch detected"
+            exit 1
+          fi
 
-          grep -q \
-            '#include "hardware/structs/ioqspi.h"' \
-            src/addons/bootsel_button.cpp
+          if grep -q \
+            "readBootselForMacro" \
+            src/addons/bootsel_button.cpp; then
+            echo "Unexpected custom BOOTSEL reader detected"
+            exit 1
+          fi
 
-          grep -q \
-            '#include "hardware/structs/sio.h"' \
-            src/addons/bootsel_button.cpp
+          echo "Official source verification passed"
 
-          python3 - <<'PY'
-          from pathlib import Path
-
-          source = Path(
-              "src/addons/bootsel_button.cpp"
-          ).read_text()
-
-          namespace_position = source.find(
-              "namespace BootselMacroBridge"
-          )
-
-          sync_position = source.find(
-              '#include "hardware/sync.h"'
-          )
-
-          qspi_position = source.find(
-              '#include "hardware/structs/ioqspi.h"'
-          )
-
-          sio_position = source.find(
-              '#include "hardware/structs/sio.h"'
-          )
-
-          if namespace_position < 0:
-              raise SystemExit(
-                  "BootselMacroBridge is missing"
-              )
-
-          if sync_position < 0:
-              raise SystemExit(
-                  "hardware/sync.h is missing"
-              )
-
-          if qspi_position < 0:
-              raise SystemExit(
-                  "hardware/structs/ioqspi.h is missing"
-              )
-
-          if sio_position < 0:
-              raise SystemExit(
-                  "hardware/structs/sio.h is missing"
-              )
-
-          if sync_position > namespace_position:
-              raise SystemExit(
-                  "hardware/sync.h appears after custom code"
-              )
-
-          if qspi_position > namespace_position:
-              raise SystemExit(
-                  "ioqspi.h appears after custom code"
-              )
-
-          if sio_position > namespace_position:
-              raise SystemExit(
-                  "sio.h appears after custom code"
-              )
-
-          print(
-              "All SDK headers appear before custom code"
-          )
-          print(
-              "BOOTSEL source order verification passed"
-          )
-          PY
-
-      - name: Configure Pico firmware
+      - name: Configure official Pico firmware
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -593,7 +110,7 @@ jobs:
             -B build \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build Pico firmware
+      - name: Build official Pico firmware
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -604,7 +121,7 @@ jobs:
             --config Release \
             --parallel 2
 
-      - name: Package UF2
+      - name: Find generated UF2
         shell: bash
         run: |
           set -euo pipefail
@@ -626,21 +143,39 @@ jobs:
             exit 1
           fi
 
-          echo "Generated UF2: $UF2_FILE"
+          echo "Generated official UF2:"
+          echo "$UF2_FILE"
+
+      - name: Package official UF2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UF2_FILE="$(
+            find gp2040-ce/build \
+              -type f \
+              -name "*.uf2" \
+              | head -n 1
+          )"
+
+          if [ -z "$UF2_FILE" ]; then
+            echo "No UF2 file was generated"
+            exit 1
+          fi
 
           cp \
             "$UF2_FILE" \
-            GP2040-CE-Pico-BOOTSEL-Bridge-Macro2-Macro6.uf2
+            GP2040-CE-Official-v0.7.12-Pico.uf2
 
           sha256sum \
-            GP2040-CE-Pico-BOOTSEL-Bridge-Macro2-Macro6.uf2 \
+            GP2040-CE-Official-v0.7.12-Pico.uf2 \
             > SHA256SUMS.txt
 
-      - name: Upload UF2 artifact
+      - name: Upload official UF2 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GP2040-CE-Pico-BOOTSEL-Bridge-Macro2-Macro6
+          name: GP2040-CE-Official-v0.7.12-Pico
           path: |
-            GP2040-CE-Pico-BOOTSEL-Bridge-Macro2-Macro6.uf2
+            GP2040-CE-Official-v0.7.12-Pico.uf2
             SHA256SUMS.txt
           if-no-files-found: error
