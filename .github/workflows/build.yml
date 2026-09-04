@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   UPSTREAM_REF: v0.7.12
@@ -29,10 +29,46 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          cache: npm
+          cache-dependency-path: gp2040-ce/www/package-lock.json
+
       - name: Setup Raspberry Pi Pico SDK
         uses: Fortinbra/RaspberryPiPicoBuild@v7
 
-      - name: Apply stable Switch 2 fix and automatic A
+      - name: Verify Pico SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d "$GITHUB_WORKSPACE/pico-sdk"
+          test -f "$GITHUB_WORKSPACE/pico-sdk/pico_sdk_init.cmake"
+
+          echo "Pico SDK found"
+
+      - name: Build web assets
+        working-directory: gp2040-ce/www
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npm ci
+          CI=false npm run build
+
+      - name: Verify generated web filesystem
+        working-directory: gp2040-ce
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f lib/httpd/fsdata.c
+
+          echo "fsdata.c generated successfully"
+
+      - name: Apply early Switch 2 fix and automatic A
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -40,6 +76,7 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           macro_file = Path("src/addons/input_macro.cpp")
           macro_source = macro_file.read_text()
@@ -66,15 +103,6 @@ jobs:
                       include_line,
                       1,
                   )
-
-          available_marker = (
-              "bool InputMacro::available() {"
-          )
-
-          if available_marker not in macro_source:
-              raise SystemExit(
-                  "InputMacro::available marker not found"
-              )
 
           helper_marker = (
               "namespace Switch2FixSupport"
@@ -104,7 +132,8 @@ jobs:
           constexpr uint64_t AUTO_A_HOLD_US =
               120000;
 
-          constexpr int AUTO_A_PRESS_COUNT = 3;
+          constexpr int AUTO_A_PRESS_COUNT =
+              3;
 
           uint64_t bootselStartTime = 0;
           uint64_t bootselLastPollTime = 0;
@@ -125,35 +154,26 @@ jobs:
           )() {
               const uint CS_PIN_INDEX = 1;
 
-              // BOOTSEL temporarily disables flash access.
-              // Interrupts must remain disabled during
-              // the complete QSPI read sequence.
               uint32_t flags =
                   save_and_disable_interrupts();
 
               hw_write_masked(
-                  &ioqspi_hw
-                      ->io[CS_PIN_INDEX]
-                      .ctrl,
+                  &ioqspi_hw->io[CS_PIN_INDEX].ctrl,
                   GPIO_OVERRIDE_LOW
                       << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
                   IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
               );
 
-              // Do not call sleep functions here.
               for (volatile int i = 0; i < 1000; ++i) {
                   __asm volatile("nop");
               }
 
-              // BOOTSEL is active low.
               bool pressed =
                   !(sio_hw->gpio_hi_in &
                     (1u << CS_PIN_INDEX));
 
               hw_write_masked(
-                  &ioqspi_hw
-                      ->io[CS_PIN_INDEX]
-                      .ctrl,
+                  &ioqspi_hw->io[CS_PIN_INDEX].ctrl,
                   GPIO_OVERRIDE_NORMAL
                       << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
                   IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
@@ -162,19 +182,6 @@ jobs:
               restore_interrupts(flags);
 
               return pressed;
-          }
-
-          void resetBootselState() {
-              bootselStartTime = 0;
-              bootselLastPollTime = 0;
-              bootselChangedTime = 0;
-
-              bootselRawState = false;
-              bootselStableState = false;
-              bootselEdgeState = false;
-
-              selectedMacro =
-                  MACRO_6_INDEX;
           }
 
           void updateBootselMacroSelector() {
@@ -186,9 +193,8 @@ jobs:
                   return;
               }
 
-              // Do not read BOOTSEL immediately after
-              // firmware startup. This is important for
-              // stable Switch 2 USB initialization.
+              // Do not access BOOTSEL immediately after
+              // startup. This protects Switch 2 enumeration.
               if (
                   now - bootselStartTime <
                   BOOTSEL_START_DELAY_US
@@ -220,11 +226,7 @@ jobs:
               ) {
                   bootselStableState = rawState;
 
-                  // Switch the macro on the BOOTSEL
-                  // press edge, not on release.
-                  //
-                  // This preserves the behavior of
-                  // the early working Switch 2 version.
+                  // Switch macro on the BOOTSEL press edge.
                   if (
                       bootselStableState &&
                       !bootselEdgeState
@@ -239,11 +241,6 @@ jobs:
                   bootselEdgeState =
                       bootselStableState;
               }
-          }
-
-          void resetAutomaticASequence() {
-              autoAStartTime = 0;
-              autoAPressCount = 0;
           }
 
           void runAutomaticASequence(
@@ -283,9 +280,8 @@ jobs:
                   elapsed >= pressStart &&
                   elapsed < pressEnd
               ) {
-                  // B1 is the primary face button
-                  // and is normally reported as A
-                  // in Nintendo Switch mode.
+                  // B1 is the primary face button.
+                  // In Switch mode it is normally A.
                   gamepad->state.buttons |=
                       GAMEPAD_MASK_B1;
               }
@@ -299,69 +295,116 @@ jobs:
           '''
 
           if helper_marker not in macro_source:
-              macro_source = macro_source.replace(
-                  available_marker,
+              available_marker = (
+                  "bool InputMacro::available()"
+              )
+
+              available_position = (
+                  macro_source.find(
+                      available_marker
+                  )
+              )
+
+              if available_position < 0:
+                  raise SystemExit(
+                      "InputMacro::available not found"
+                  )
+
+              macro_source = (
+                  macro_source[:available_position] +
                   helper_code.strip() +
                   "\n\n" +
-                  available_marker,
-                  1,
+                  macro_source[available_position:]
               )
 
-          old_trigger_block = '''    // Go through our macro list
-          pressedMacro = -1;
-          for(int i = 0; i < MAX_MACRO_LIMIT; i++) {'''
-
-          new_trigger_block = '''    updateBootselMacroSelector();
-
-          // BOOTSEL selects Macro 6 or Macro 2.
-          //
-          // The official macro pin configuration is
-          // retained. The selected macro is injected
-          // into the normal InputMacro path.
-          if (
-              macroPinMasks[MACRO_2_INDEX] &&
-              macroPinMasks[MACRO_6_INDEX] &&
-              (
-                  allPins &
-                  macroPinMasks[MACRO_2_INDEX]
-              )
-          ) {
-              pressedMacro =
-                  selectedMacro;
-
-              return;
-          }
-
-          // Go through our macro list
-          pressedMacro = -1;
-          for(int i = 0; i < MAX_MACRO_LIMIT; i++) {'''
-
-          if old_trigger_block not in macro_source:
-              raise SystemExit(
-                  "InputMacro trigger block not found"
-              )
-
-          macro_source = macro_source.replace(
-              old_trigger_block,
-              new_trigger_block,
-              1,
+          /*
+           * Locate the macro trigger loop by structure,
+           * not by exact indentation.
+           */
+          trigger_pattern = re.compile(
+              r"""
+              (?P<indent>[ \t]*)
+              pressedMacro\s*=\s*-1\s*;
+              (?P<newline>\r?\n)
+              (?P<loopindent>[ \t]*)
+              for\s*\(\s*int\s+i\s*=\s*0\s*;
+              \s*i\s*<\s*MAX_MACRO_LIMIT\s*;
+              \s*i\s*\+\+\s*\)\s*\{
+              """,
+              re.MULTILINE |
+              re.VERBOSE,
           )
 
-          preprocess_marker = (
-              "void InputMacro::preprocess()\n{"
+          trigger_match = trigger_pattern.search(
+              macro_source
           )
 
-          if preprocess_marker not in macro_source:
-              preprocess_marker = (
-                  "void InputMacro::preprocess()\r\n{"
-              )
-
-          if preprocess_marker not in macro_source:
+          if trigger_match is None:
               raise SystemExit(
-                  "InputMacro::preprocess marker not found"
+                  "Could not locate InputMacro macro trigger loop"
               )
 
-          auto_a_call = '''
+          trigger_indent = trigger_match.group(
+              "indent"
+          )
+
+          loop_indent = trigger_match.group(
+              "loopindent"
+          )
+
+          selector_block = f"""
+          {trigger_indent}Switch2FixSupport::updateBootselMacroSelector();
+
+          {trigger_indent}// BOOTSEL selects Macro 2 or Macro 6.
+          {trigger_indent}// Reuse the normal InputMacro path.
+          {trigger_indent}if (
+          {trigger_indent}    macroPinMasks[Switch2FixSupport::MACRO_2_INDEX] &&
+          {trigger_indent}    macroPinMasks[Switch2FixSupport::MACRO_6_INDEX] &&
+          {trigger_indent}    (
+          {trigger_indent}        allPins &
+          {trigger_indent}        macroPinMasks[Switch2FixSupport::MACRO_2_INDEX]
+          {trigger_indent}    )
+          {trigger_indent}) {{
+          {trigger_indent}    pressedMacro =
+          {trigger_indent}        Switch2FixSupport::selectedMacro;
+          {trigger_indent}    return;
+          {trigger_indent}}}
+
+          {trigger_indent}pressedMacro = -1;
+          {loop_indent}for(int i = 0; i < MAX_MACRO_LIMIT; i++) {{
+          """
+
+          macro_source = (
+              macro_source[:trigger_match.start()] +
+              selector_block +
+              macro_source[trigger_match.end():]
+          )
+
+          /*
+           * Add automatic A call at the beginning of
+           * InputMacro::preprocess(), tolerating spaces
+           * and CRLF/LF line endings.
+           */
+          preprocess_pattern = re.compile(
+              r"""
+              void\s+InputMacro::preprocess\s*\(\s*\)
+              \s*\{
+              """,
+              re.MULTILINE |
+              re.VERBOSE,
+          )
+
+          preprocess_match = preprocess_pattern.search(
+              macro_source
+          )
+
+          if preprocess_match is None:
+              raise SystemExit(
+                  "InputMacro::preprocess not found"
+              )
+
+          auto_a_call = r"""
+
           {
               Gamepad* gamepad =
                   Storage::getInstance()
@@ -372,23 +415,21 @@ jobs:
               );
           }
 
-          '''
+          """
 
-          macro_source = macro_source.replace(
-              preprocess_marker,
-              preprocess_marker +
-              auto_a_call,
-              1,
+          macro_source = (
+              macro_source[:preprocess_match.end()] +
+              auto_a_call +
+              macro_source[preprocess_match.end():]
           )
 
           macro_file.write_text(macro_source)
 
-          # Disable the original BOOTSEL addon.
-          #
-          # The custom BOOTSEL selector above is deliberately
-          # located in input_macro.cpp because the early
-          # Switch 2 Fix version used this architecture and
-          # was able to enumerate on Switch 2.
+          /*
+           * Disable the original BOOTSEL addon.
+           * BOOTSEL handling is now inside input_macro.cpp,
+           * matching the early Switch 2 Fix architecture.
+           */
           bootsel_file = Path(
               "src/addons/bootsel_button.cpp"
           )
@@ -402,10 +443,10 @@ jobs:
           )
 
           print(
-              "Stable early Switch 2 architecture installed"
+              "Early Switch 2 Fix architecture installed"
           )
           print(
-              "Original BOOTSEL addon disabled"
+              "Regex-based macro trigger patch applied"
           )
           print(
               "BOOTSEL polling starts after one second"
@@ -414,20 +455,17 @@ jobs:
               "BOOTSEL polling interval: 20 ms"
           )
           print(
-              "BOOTSEL debounce: 30 ms"
+              "BOOTSEL debounce interval: 30 ms"
           )
           print(
-              "Automatic A sequence added"
-          )
-          print(
-              "Automatic A count: 3"
+              "Automatic A presses: 3"
           )
           print(
               "Automatic A interval: 500 ms"
           )
           PY
 
-      - name: Verify Switch 2 fix source
+      - name: Verify patched source
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -473,20 +511,13 @@ jobs:
             src/addons/bootsel_button.cpp
 
           if grep -q \
-            "BootselMacroBridge" \
-            src/addons/bootsel_button.cpp; then
-            echo "Unexpected old BOOTSEL bridge remains"
+            "InputMacro trigger block not found" \
+            src/addons/input_macro.cpp; then
+            echo "Old failed patch text was written into source"
             exit 1
           fi
 
-          if grep -q \
-            "readBootselForMacro" \
-            src/addons/bootsel_button.cpp; then
-            echo "Unexpected old BOOTSEL reader remains"
-            exit 1
-          fi
-
-          echo "Switch 2 fix source verification passed"
+          echo "Patched source verification passed"
 
       - name: Configure Pico firmware
         working-directory: gp2040-ce
@@ -495,6 +526,7 @@ jobs:
           set -euo pipefail
 
           test -d "$GITHUB_WORKSPACE/pico-sdk"
+          test -f "$GITHUB_WORKSPACE/pico-sdk/pico_sdk_init.cmake"
 
           export PICO_SDK_PATH="$GITHUB_WORKSPACE/pico-sdk"
           export GP2040_BOARDCONFIG=Pico
@@ -505,7 +537,7 @@ jobs:
             -B build \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build Pico UF2
+      - name: Build Pico firmware
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -516,28 +548,18 @@ jobs:
             --config Release \
             --parallel 2
 
-      - name: Find generated Pico UF2
+      - name: Find generated UF2
         shell: bash
         run: |
           set -euo pipefail
 
           UF2_FILE="$(
             find gp2040-ce/build \
-              -maxdepth 2 \
+              -maxdepth 3 \
               -type f \
-              -name "GP2040-CE_*_Pico.uf2" \
+              -name "*.uf2" \
               | head -n 1
           )"
-
-          if [ -z "$UF2_FILE" ]; then
-              UF2_FILE="$(
-                find gp2040-ce/build \
-                  -maxdepth 3 \
-                  -type f \
-                  -name "*.uf2" \
-                  | head -n 1
-              )"
-          fi
 
           if [ -z "$UF2_FILE" ]; then
             echo "Pico UF2 file was not generated"
@@ -556,7 +578,7 @@ jobs:
           echo "Generated UF2:"
           echo "$UF2_FILE"
 
-      - name: Package UF2 and checksum
+      - name: Package UF2
         shell: bash
         run: |
           set -euo pipefail
@@ -572,12 +594,9 @@ jobs:
             GP2040-CE-v0.7.12-Switch2-Fix-AutoA.uf2 \
             > SHA256SUMS.txt
 
-          echo "Packaged firmware:"
-          ls -lh \
-            GP2040-CE-v0.7.12-Switch2-Fix-AutoA.uf2 \
-            SHA256SUMS.txt
+          echo "Firmware package created"
 
-      - name: Upload Switch 2 firmware
+      - name: Upload UF2 artifact
         uses: actions/upload-artifact@v4
         with:
           name: GP2040-CE-v0.7.12-Switch2-Fix-AutoA
