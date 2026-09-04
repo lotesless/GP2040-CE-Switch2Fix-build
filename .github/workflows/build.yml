@@ -37,7 +37,18 @@ jobs:
           cache-dependency-path: gp2040-ce/www/package-lock.json
 
       - name: Setup Raspberry Pi Pico SDK
-        uses: Fortinbra/RaspberryPicoBuild@v7
+        uses: Fortinbra/RaspberryPiPicoBuild@v7
+
+      - name: Verify Pico SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d "$GITHUB_WORKSPACE/pico-sdk"
+          test -f "$GITHUB_WORKSPACE/pico-sdk/pico_sdk_init.cmake"
+
+          echo "Pico SDK is available:"
+          echo "$GITHUB_WORKSPACE/pico-sdk"
 
       - name: Build official web assets
         working-directory: gp2040-ce/www
@@ -58,7 +69,7 @@ jobs:
 
           echo "Official web filesystem generated successfully"
 
-      - name: Install BOOTSEL bridge and auto A sequence
+      - name: Install BOOTSEL bridge and automatic A sequence
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -81,22 +92,23 @@ jobs:
               constexpr uint32_t MACRO_6_GPIO_MASK =
                   1u << 7;
 
-              // Start automatic A sequence after
-              // the firmware has been running for 2 seconds.
+              // Wait two seconds after firmware startup
+              // before sending the automatic A sequence.
               constexpr uint64_t AUTO_A_START_DELAY_US =
                   2000000;
 
-              // Three A presses, one every 500 ms.
+              // Start one A press every 500 milliseconds.
               constexpr uint64_t AUTO_A_INTERVAL_US =
                   500000;
 
-              // Each A press is held for 120 ms.
+              // Hold A for 120 milliseconds.
               constexpr uint64_t AUTO_A_HOLD_US =
                   120000;
 
               constexpr uint8_t AUTO_A_PRESS_COUNT =
                   3;
 
+              // Read BOOTSEL at a limited frequency.
               constexpr uint64_t BOOTSEL_POLL_INTERVAL_US =
                   40000;
 
@@ -104,14 +116,13 @@ jobs:
                   30000;
 
               uint64_t firmwareStartTime = 0;
-
               uint64_t lastBootselPollTime = 0;
               uint64_t bootselChangedTime = 0;
 
               bool rawBootselPressed = false;
               bool stableBootselPressed = false;
 
-              // First BOOTSEL press runs Macro 6.
+              // The first BOOTSEL press triggers Macro 6.
               uint32_t selectedMacroPin =
                   MACRO_6_GPIO_MASK;
 
@@ -123,8 +134,9 @@ jobs:
           )() {
               const uint CS_PIN_INDEX = 1;
 
-              // This is the official GP2040-CE BOOTSEL
-              // read sequence for RP2040.
+              // Disable interrupts because flash access
+              // is temporarily unavailable while reading
+              // the RP2040 BOOTSEL button.
               uint32_t flags =
                   save_and_disable_interrupts();
 
@@ -135,7 +147,8 @@ jobs:
                   IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
               );
 
-              // No flash-resident sleep function here.
+              // Do not call flash-resident delay functions
+              // while QSPI chip select is overridden.
               for (volatile int i = 0; i < 1000; ++i) {
                   __asm volatile("nop");
               }
@@ -145,6 +158,7 @@ jobs:
                   !(sio_hw->gpio_hi_in &
                     (1u << CS_PIN_INDEX));
 
+              // Restore normal QSPI chip-select operation.
               hw_write_masked(
                   &ioqspi_hw->io[CS_PIN_INDEX].ctrl,
                   GPIO_OVERRIDE_NORMAL
@@ -158,10 +172,9 @@ jobs:
           }
 
           bool BootselButtonAddon::available() {
-              // Always load this addon because it provides:
-              // 1. official BOOTSEL input
-              // 2. BOOTSEL macro switching
-              // 3. automatic A test sequence
+              // Always load this addon because it provides
+              // the automatic A sequence and BOOTSEL macro
+              // switching.
               return true;
           }
 
@@ -171,6 +184,8 @@ jobs:
                       .getAddonOptions()
                       .bootselButtonOptions;
 
+              // Preserve the configured official BOOTSEL
+              // button mapping.
               bootselButtonMap =
                   options.buttonMap;
 
@@ -178,7 +193,8 @@ jobs:
                   getMicro();
 
               lastBootselPollTime = 0;
-              bootselChangedTime = firmwareStartTime;
+              bootselChangedTime =
+                  firmwareStartTime;
 
               rawBootselPressed = false;
               stableBootselPressed = false;
@@ -196,23 +212,18 @@ jobs:
               uint64_t now =
                   getMicro();
 
-              /*
-               * Automatic A test sequence
-               *
-               * Firmware start + 2.000 s:
-               *     A press 1
-               *
-               * Firmware start + 2.500 s:
-               *     A press 2
-               *
-               * Firmware start + 3.000 s:
-               *     A press 3
-               *
-               * Each press lasts 120 ms.
-               */
               uint64_t elapsed =
                   now - firmwareStartTime;
 
+              /*
+               * Automatic A sequence:
+               *
+               * 2.0 seconds: first A
+               * 2.5 seconds: second A
+               * 3.0 seconds: third A
+               *
+               * Each A press lasts 120 milliseconds.
+               */
               if (
                   autoAPressCount <
                   AUTO_A_PRESS_COUNT
@@ -226,33 +237,28 @@ jobs:
                           AUTO_A_INTERVAL_US
                       );
 
+                  uint64_t pressEnd =
+                      pressStart +
+                      AUTO_A_HOLD_US;
+
                   if (
                       elapsed >= pressStart &&
-                      elapsed <
-                          pressStart +
-                          AUTO_A_HOLD_US
+                      elapsed < pressEnd
                   ) {
-                      // GAMEPAD_MASK_B1 is the standard
-                      // GP2040-CE primary face button,
-                      // normally mapped as A on Switch.
+                      // GP2040-CE primary face button.
+                      // In Nintendo Switch mode this is
+                      // normally reported as A.
                       gamepad->state.buttons |=
                           GAMEPAD_MASK_B1;
                   }
 
-                  if (
-                      elapsed >=
-                          pressStart +
-                          AUTO_A_HOLD_US
-                  ) {
+                  if (elapsed >= pressEnd) {
                       autoAPressCount++;
                   }
               }
 
               /*
-               * BOOTSEL polling
-               *
-               * BOOTSEL is read only once every 40 ms
-               * and debounced for 30 ms.
+               * BOOTSEL polling and debounce.
                */
               bool shouldPoll =
                   lastBootselPollTime == 0 ||
@@ -260,7 +266,8 @@ jobs:
                       BOOTSEL_POLL_INTERVAL_US;
 
               if (shouldPoll) {
-                  lastBootselPollTime = now;
+                  lastBootselPollTime =
+                      now;
 
                   bool currentRawPressed =
                       isBootselPressed();
@@ -289,10 +296,12 @@ jobs:
                           rawBootselPressed;
 
                       /*
-                       * Change macro after BOOTSEL release.
+                       * Switch to the next macro only
+                       * after BOOTSEL is released.
                        *
-                       * First release  -> next is Macro 2
-                       * Second release -> next is Macro 6
+                       * First press:  Macro 6
+                       * Second press: Macro 2
+                       * Third press:  Macro 6
                        */
                       if (!stableBootselPressed) {
                           if (
@@ -310,7 +319,8 @@ jobs:
               }
 
               /*
-               * Preserve the official BOOTSEL button map.
+               * Preserve the official BOOTSEL button
+               * mapping when one is configured.
                */
               if (
                   stableBootselPressed &&
@@ -345,12 +355,12 @@ jobs:
               }
 
               /*
-               * Convert BOOTSEL to a virtual macro input.
+               * GP6 and GP7 are virtual macro inputs:
                *
                * GP6 = Macro 2
                * GP7 = Macro 6
                *
-               * Keep GP6 and GP7 physically disconnected.
+               * Clear their physical GPIO states first.
                */
               const uint32_t bothMacroPins =
                   MACRO_2_GPIO_MASK |
@@ -359,6 +369,8 @@ jobs:
               gamepad->debouncedGpio &=
                   ~bothMacroPins;
 
+              // Present exactly one virtual macro input
+              // while BOOTSEL is pressed.
               if (stableBootselPressed) {
                   gamepad->debouncedGpio |=
                       selectedMacroPin;
@@ -375,6 +387,7 @@ jobs:
           set -euo pipefail
 
           test -f src/addons/bootsel_button.cpp
+          test -f src/addons/input_macro.cpp
 
           grep -q \
             "BootselButtonAddon::isBootselPressed" \
@@ -401,6 +414,10 @@ jobs:
             src/addons/bootsel_button.cpp
 
           grep -q \
+            "AUTO_A_HOLD_US" \
+            src/addons/bootsel_button.cpp
+
+          grep -q \
             "MACRO_2_GPIO_MASK" \
             src/addons/bootsel_button.cpp
 
@@ -411,8 +428,6 @@ jobs:
           grep -q \
             "gamepad->debouncedGpio" \
             src/addons/bootsel_button.cpp
-
-          test -f src/addons/input_macro.cpp
 
           grep -q \
             "InputMacro::runCurrentMacro" \
@@ -427,6 +442,7 @@ jobs:
           set -euo pipefail
 
           test -d "$GITHUB_WORKSPACE/pico-sdk"
+          test -f "$GITHUB_WORKSPACE/pico-sdk/pico_sdk_init.cmake"
 
           export PICO_SDK_PATH="$GITHUB_WORKSPACE/pico-sdk"
           export GP2040_BOARDCONFIG=Pico
@@ -448,6 +464,7 @@ jobs:
             --parallel 2
 
       - name: Find generated UF2
+        id: find-uf2
         shell: bash
         run: |
           set -euo pipefail
@@ -472,22 +489,22 @@ jobs:
           echo "Generated UF2:"
           echo "$UF2_FILE"
 
+          echo "uf2_file=$UF2_FILE" \
+            >> "$GITHUB_OUTPUT"
+
       - name: Package UF2
         shell: bash
         run: |
           set -euo pipefail
 
-          UF2_FILE="$(
-            find gp2040-ce/build \
-              -type f \
-              -name "*.uf2" \
-              | head -n 1
-          )"
+          UF2_FILE="${{ steps.find-uf2.outputs.uf2_file }}"
 
           if [ -z "$UF2_FILE" ]; then
-            echo "No UF2 file was generated"
+            echo "UF2 output path is empty"
             exit 1
           fi
+
+          test -f "$UF2_FILE"
 
           cp \
             "$UF2_FILE" \
@@ -497,6 +514,11 @@ jobs:
             GP2040-CE-Pico-Switch2-AutoA-Macro2-Macro6.uf2 \
             > SHA256SUMS.txt
 
+          echo "Packaged files:"
+          ls -lh \
+            GP2040-CE-Pico-Switch2-AutoA-Macro2-Macro6.uf2 \
+            SHA256SUMS.txt
+
       - name: Upload UF2 artifact
         uses: actions/upload-artifact@v4
         with:
@@ -505,3 +527,4 @@ jobs:
             GP2040-CE-Pico-Switch2-AutoA-Macro2-Macro6.uf2
             SHA256SUMS.txt
           if-no-files-found: error
+          retention-days: 30
