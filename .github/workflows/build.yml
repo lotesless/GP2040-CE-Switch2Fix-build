@@ -44,6 +44,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           npm ci
           CI=false npm run build
 
@@ -52,10 +53,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           test -f lib/httpd/fsdata.c
           echo "fsdata.c generated successfully"
 
-      - name: Apply safe BOOTSEL patch
+      - name: Apply BOOTSEL macro bridge patch
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -64,162 +66,228 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("src/addons/input_macro.cpp")
+          path = Path("src/addons/bootsel_button.cpp")
           source = path.read_text()
 
-          include_anchor = '#include "hardware/gpio.h"'
+          include_anchor = '#include "addons/bootsel_button.h"'
 
-          required_headers = [
+          required_includes = [
+              '#include "storagemanager.h"',
               '#include "hardware/sync.h"',
               '#include "hardware/structs/ioqspi.h"',
               '#include "hardware/structs/sio.h"',
               '#include "helper.h"',
+              '#include "config.pb.h"',
           ]
 
           if include_anchor not in source:
-              raise SystemExit("Cannot find hardware/gpio.h include")
+              raise SystemExit(
+                  "Cannot find BOOTSEL include anchor"
+              )
 
-          for header in required_headers:
-              if header not in source:
+          for include_line in required_includes:
+              if include_line not in source:
                   source = source.replace(
                       include_anchor,
-                      include_anchor + "\n" + header,
+                      include_anchor + "\n" + include_line,
                       1,
                   )
 
-          helper_marker = (
-              "bool __no_inline_not_in_flash_func("
-              "readBootselButton)()"
+          namespace_marker = (
+              "namespace BootselMacroBridge"
           )
 
-          if helper_marker not in source:
-              available_marker = "bool InputMacro::available() {"
+          namespace_code = r'''
+          namespace BootselMacroBridge {
 
-              helper = r'''
-          namespace {
-          constexpr int BOOTSEL_MACRO_2 = 1;
-          constexpr int BOOTSEL_MACRO_6 = 5;
+          constexpr uint32_t MACRO_2_GPIO_MASK =
+              1u << 6;
 
-          constexpr uint64_t BOOTSEL_START_DELAY_US = 1000000;
-          constexpr uint64_t BOOTSEL_POLL_INTERVAL_US = 50000;
-          constexpr uint64_t BOOTSEL_DEBOUNCE_US = 30000;
+          constexpr uint32_t MACRO_6_GPIO_MASK =
+              1u << 7;
 
-          uint64_t bootselStartedAt = 0;
-          uint64_t bootselLastPollAt = 0;
-          uint64_t bootselChangedAt = 0;
+          constexpr uint64_t START_DELAY_US =
+              1000000;
 
-          bool bootselRawPressed = false;
-          bool bootselStablePressed = false;
-          bool bootselPressEvent = false;
+          constexpr uint64_t POLL_INTERVAL_US =
+              50000;
+
+          constexpr uint64_t DEBOUNCE_US =
+              30000;
+
+          uint64_t startedAt = 0;
+          uint64_t lastPollAt = 0;
+          uint64_t changedAt = 0;
+
+          bool rawPressed = false;
+          bool stablePressed = false;
 
           // The first BOOTSEL press runs Macro 6.
-          int selectedBootselMacro = BOOTSEL_MACRO_6;
+          uint32_t activeMacroMask =
+              MACRO_6_GPIO_MASK;
 
           bool __no_inline_not_in_flash_func(
-              readBootselButton
+              readBootselForMacro
           )() {
               const uint CS_PIN_INDEX = 1;
 
-              uint32_t flags = save_and_disable_interrupts();
+              // BOOTSEL is connected to the RP2040
+              // QSPI chip-select pin.
+              uint32_t flags =
+                  save_and_disable_interrupts();
 
               hw_write_masked(
-                  &ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                  &ioqspi_hw
+                      ->io[CS_PIN_INDEX]
+                      .ctrl,
                   GPIO_OVERRIDE_LOW
                       << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
                   IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
               );
 
+              // Do not call flash-resident functions
+              // while QSPI chip select is overridden.
               for (volatile int i = 0; i < 1000; ++i) {
                   __asm volatile("nop");
               }
 
+              // BOOTSEL is active low.
               bool pressed =
                   !(sio_hw->gpio_hi_in &
                     (1u << CS_PIN_INDEX));
 
               hw_write_masked(
-                  &ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                  &ioqspi_hw
+                      ->io[CS_PIN_INDEX]
+                      .ctrl,
                   GPIO_OVERRIDE_NORMAL
                       << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
                   IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
               );
 
               restore_interrupts(flags);
+
               return pressed;
           }
 
-          void updateBootselButton() {
+          void update() {
               uint64_t now = getMicro();
 
-              if (bootselStartedAt == 0) {
-                  bootselStartedAt = now;
+              if (startedAt == 0) {
+                  startedAt = now;
+                  changedAt = now;
                   return;
               }
 
+              // Do not access BOOTSEL during startup.
               if (
-                  now - bootselStartedAt <
-                  BOOTSEL_START_DELAY_US
+                  now - startedAt <
+                  START_DELAY_US
               ) {
                   return;
               }
 
               if (
-                  now - bootselLastPollAt <
-                  BOOTSEL_POLL_INTERVAL_US
+                  now - lastPollAt <
+                  POLL_INTERVAL_US
               ) {
                   return;
               }
 
-              bootselLastPollAt = now;
+              lastPollAt = now;
 
-              bool rawPressed = readBootselButton();
+              bool currentRaw =
+                  readBootselForMacro();
 
-              if (rawPressed != bootselRawPressed) {
-                  bootselRawPressed = rawPressed;
-                  bootselChangedAt = now;
+              if (currentRaw != rawPressed) {
+                  rawPressed = currentRaw;
+                  changedAt = now;
               }
 
               if (
-                  now - bootselChangedAt >=
-                      BOOTSEL_DEBOUNCE_US &&
-                  bootselRawPressed !=
-                      bootselStablePressed
+                  now - changedAt >=
+                      DEBOUNCE_US &&
+                  rawPressed != stablePressed
               ) {
-                  bootselStablePressed =
-                      bootselRawPressed;
+                  stablePressed = rawPressed;
 
-                  if (bootselStablePressed) {
-                      bootselPressEvent = true;
+                  // Switch the selected macro only after
+                  // the button has been released.
+                  //
+                  // This guarantees:
+                  // first press  = Macro 6
+                  // second press = Macro 2
+                  if (!stablePressed) {
+                      if (
+                          activeMacroMask ==
+                          MACRO_6_GPIO_MASK
+                      ) {
+                          activeMacroMask =
+                              MACRO_2_GPIO_MASK;
+                      } else {
+                          activeMacroMask =
+                              MACRO_6_GPIO_MASK;
+                      }
                   }
               }
           }
+
+          void applyVirtualMacroPin(
+              Gamepad* gamepad
+          ) {
+              const uint32_t bothMacroMasks =
+                  MACRO_2_GPIO_MASK |
+                  MACRO_6_GPIO_MASK;
+
+              // GP6 and GP7 are virtual macro inputs.
+              // Remove their physical GPIO states first.
+              //
+              // This makes GP6 and GP7 safe to leave
+              // disconnected or permanently grounded.
+              gamepad->debouncedGpio &=
+                  ~bothMacroMasks;
+
+              // While BOOTSEL is stably pressed,
+              // expose exactly one virtual macro pin.
+              if (stablePressed) {
+                  gamepad->debouncedGpio |=
+                      activeMacroMask;
+              }
+          }
+
           }
           '''
 
-              if available_marker not in source:
-                  raise SystemExit(
-                      "Cannot find InputMacro::available()"
-                  )
-
+          if namespace_marker not in source:
               source = source.replace(
-                  available_marker,
-                  helper + "\n" + available_marker,
+                  include_anchor,
+                  include_anchor +
+                  "\n" +
+                  namespace_code,
                   1,
               )
 
-          def replace_function(text, signature, replacement):
+          def replace_function(
+              text,
+              signature,
+              replacement
+          ):
               start = text.find(signature)
 
               if start < 0:
                   raise SystemExit(
-                      "Cannot find " + signature
+                      "Cannot find function: " +
+                      signature
                   )
 
-              opening_brace = text.find("{", start)
+              opening_brace = text.find(
+                  "{",
+                  start,
+              )
 
               if opening_brace < 0:
                   raise SystemExit(
-                      "Cannot find opening brace for " +
+                      "Cannot find opening brace: " +
                       signature
                   )
 
@@ -228,12 +296,13 @@ jobs:
 
               for index in range(
                   opening_brace,
-                  len(text)
+                  len(text),
               ):
                   character = text[index]
 
                   if character == "{":
                       depth += 1
+
                   elif character == "}":
                       depth -= 1
 
@@ -243,7 +312,7 @@ jobs:
 
               if end < 0:
                   raise SystemExit(
-                      "Cannot find closing brace for " +
+                      "Cannot find closing brace: " +
                       signature
                   )
 
@@ -253,155 +322,149 @@ jobs:
                   text[end:]
               )
 
-          new_check_macro_press = r'''
-          void InputMacro::checkMacroPress() {
-              updateBootselButton();
-
-              // BOOTSEL is the only runtime trigger.
-              // GP6 and GP7 input states are ignored.
-              pressedMacro = -1;
-
-              if (!bootselPressEvent) {
-                  return;
-              }
-
-              // Consume exactly one event for each press.
-              bootselPressEvent = false;
-
-              if (isMacroRunning) {
-                  return;
-              }
-
-              if (
-                  selectedBootselMacro < 0 ||
-                  selectedBootselMacro >= MAX_MACRO_LIMIT
-              ) {
-                  return;
-              }
-
-              if (
-                  !inputMacroOptions
-                      ->macroList[selectedBootselMacro]
-                      .enabled
-              ) {
-                  return;
-              }
-
-              pressedMacro = selectedBootselMacro;
+          new_available = r'''
+          bool BootselButtonAddon::available() {
+              // Always load this addon because it is also
+              // used as the BOOTSEL-to-macro bridge.
+              return true;
           }
           '''
 
-          new_check_macro_action = r'''
-          void InputMacro::checkMacroAction() {
-              bool macroInputPressed =
-                  pressedMacro >= 0 &&
-                  pressedMacro < MAX_MACRO_LIMIT;
+          new_setup = r'''
+          void BootselButtonAddon::setup() {
+              const BootselButtonOptions& options =
+                  Storage::getInstance()
+                      .getAddonOptions()
+                      .bootselButtonOptions;
 
-              if (!macroInputPressed) {
-                  prevMacroInputPressed = false;
-                  return;
-              }
+              // Preserve the official BOOTSEL button
+              // configuration if one exists.
+              bootselButtonMap =
+                  options.buttonMap;
+          }
+          '''
 
-              if (isMacroRunning) {
-                  prevMacroInputPressed = false;
-                  return;
-              }
+          new_preprocess = r'''
+          void BootselButtonAddon::preprocess() {
+              Gamepad* gamepad =
+                  Storage::getInstance()
+                      .GetGamepad();
 
-              macroPosition = pressedMacro;
+              BootselMacroBridge::update();
 
+              // Preserve the official BOOTSEL button
+              // behavior when a button map is configured.
               if (
-                  macroPosition < 0 ||
-                  macroPosition >= MAX_MACRO_LIMIT
+                  BootselMacroBridge::stablePressed &&
+                  bootselButtonMap != 0
               ) {
-                  reset();
-                  return;
+                  switch (bootselButtonMap) {
+                      case GAMEPAD_MASK_DU:
+                          gamepad->state.dpad |=
+                              GAMEPAD_MASK_UP;
+                          break;
+
+                      case GAMEPAD_MASK_DD:
+                          gamepad->state.dpad |=
+                              GAMEPAD_MASK_DOWN;
+                          break;
+
+                      case GAMEPAD_MASK_DL:
+                          gamepad->state.dpad |=
+                              GAMEPAD_MASK_LEFT;
+                          break;
+
+                      case GAMEPAD_MASK_DR:
+                          gamepad->state.dpad |=
+                              GAMEPAD_MASK_RIGHT;
+                          break;
+
+                      default:
+                          gamepad->state.buttons |=
+                              bootselButtonMap;
+                          break;
+                  }
               }
 
-              Macro& macro =
-                  inputMacroOptions
-                      ->macroList[macroPosition];
-
-              if (
-                  !macro.enabled ||
-                  macro.macroInputs_count == 0
-              ) {
-                  reset();
-                  return;
-              }
-
-              macroInputPosition = 0;
-              isMacroTriggerHeld = true;
-
-              MacroInput& macroInput =
-                  macro.macroInputs[macroInputPosition];
-
-              uint32_t macroInputDuration =
-                  macroInput.duration +
-                  macroInput.waitDuration;
-
-              macroInputHoldTime =
-                  macroInputDuration <= 0
-                      ? INPUT_HOLD_US
-                      : macroInputDuration;
-
-              isMacroRunning = true;
-              macroStartTime = getMicro();
-
-              // Alternate only after a macro starts.
-              selectedBootselMacro =
-                  selectedBootselMacro ==
-                          BOOTSEL_MACRO_6
-                      ? BOOTSEL_MACRO_2
-                      : BOOTSEL_MACRO_6;
-
-              prevMacroInputPressed = false;
+              // Expose BOOTSEL as one virtual macro GPIO.
+              //
+              // The official InputMacro addon will process
+              // this through its normal implementation.
+              BootselMacroBridge::applyVirtualMacroPin(
+                  gamepad
+              );
           }
           '''
 
           source = replace_function(
               source,
-              "void InputMacro::checkMacroPress()",
-              new_check_macro_press,
+              "bool BootselButtonAddon::available()",
+              new_available,
           )
 
           source = replace_function(
               source,
-              "void InputMacro::checkMacroAction()",
-              new_check_macro_action,
+              "void BootselButtonAddon::setup()",
+              new_setup,
+          )
+
+          source = replace_function(
+              source,
+              "void BootselButtonAddon::preprocess()",
+              new_preprocess,
           )
 
           path.write_text(source)
 
-          print("Safe BOOTSEL patch applied successfully")
-          print("First BOOTSEL press: Macro 6")
-          print("Second BOOTSEL press: Macro 2")
-          print("GP6 and GP7 GPIO states are ignored")
+          print(
+              "BOOTSEL macro bridge patch applied"
+          )
+          print(
+              "Official input_macro.cpp unchanged"
+          )
+          print(
+              "Official runCurrentMacro() unchanged"
+          )
+          print(
+              "First press selects Macro 6"
+          )
+          print(
+              "Second press selects Macro 2"
+          )
+          print(
+              "GP6 and GP7 physical states are ignored"
+          )
           PY
 
-      - name: Verify safe BOOTSEL patch
+      - name: Verify BOOTSEL macro bridge
         working-directory: gp2040-ce
         shell: bash
         run: |
           set -euo pipefail
 
+          test -f src/addons/bootsel_button.cpp
+
+          grep -q "namespace BootselMacroBridge" \
+            src/addons/bootsel_button.cpp
+
+          grep -q "MACRO_2_GPIO_MASK" \
+            src/addons/bootsel_button.cpp
+
+          grep -q "MACRO_6_GPIO_MASK" \
+            src/addons/bootsel_button.cpp
+
+          grep -q "readBootselForMacro" \
+            src/addons/bootsel_button.cpp
+
+          grep -q "applyVirtualMacroPin" \
+            src/addons/bootsel_button.cpp
+
+          grep -q "return true" \
+            src/addons/bootsel_button.cpp
+
           test -f src/addons/input_macro.cpp
 
-          grep -q "readBootselButton" \
-            src/addons/input_macro.cpp
-
-          grep -q "BOOTSEL_MACRO_2 = 1" \
-            src/addons/input_macro.cpp
-
-          grep -q "BOOTSEL_MACRO_6 = 5" \
-            src/addons/input_macro.cpp
-
-          grep -q "macroPosition < 0" \
-            src/addons/input_macro.cpp
-
-          grep -q "macro.macroInputs_count == 0" \
-            src/addons/input_macro.cpp
-
-          echo "Safe BOOTSEL patch verification passed"
+          echo "BOOTSEL macro bridge verification passed"
 
       - name: Configure Pico firmware
         working-directory: gp2040-ce
@@ -442,7 +505,9 @@ jobs:
 
           if [ -z "$UF2_FILE" ]; then
             echo "No UF2 file was generated"
-            find gp2040-ce/build -type f | sort
+            find gp2040-ce/build \
+              -type f \
+              | sort
             exit 1
           fi
 
@@ -450,17 +515,17 @@ jobs:
 
           cp \
             "$UF2_FILE" \
-            GP2040-CE-Pico-BOOTSEL-Safe-Macro2-Macro6.uf2
+            GP2040-CE-Pico-BOOTSEL-Bridge-Macro2-Macro6.uf2
 
           sha256sum \
-            GP2040-CE-Pico-BOOTSEL-Safe-Macro2-Macro6.uf2 \
+            GP2040-CE-Pico-BOOTSEL-Bridge-Macro2-Macro6.uf2 \
             > SHA256SUMS.txt
 
       - name: Upload UF2 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GP2040-CE-Pico-BOOTSEL-Safe-Macro2-Macro6
+          name: GP2040-CE-Pico-BOOTSEL-Bridge-Macro2-Macro6
           path: |
-            GP2040-CE-Pico-BOOTSEL-Safe-Macro2-Macro6.uf2
+            GP2040-CE-Pico-BOOTSEL-Bridge-Macro2-Macro6.uf2
             SHA256SUMS.txt
           if-no-files-found: error
