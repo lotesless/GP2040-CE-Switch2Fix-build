@@ -122,7 +122,7 @@ jobs:
           bool rawPressed = false;
           bool stablePressed = false;
 
-          // The first BOOTSEL press runs Macro 6.
+          // First BOOTSEL press selects Macro 6.
           uint32_t activeMacroMask =
               MACRO_6_GPIO_MASK;
 
@@ -131,8 +131,6 @@ jobs:
           )() {
               const uint CS_PIN_INDEX = 1;
 
-              // BOOTSEL is connected to the RP2040
-              // QSPI chip-select pin.
               uint32_t flags =
                   save_and_disable_interrupts();
 
@@ -145,8 +143,6 @@ jobs:
                   IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
               );
 
-              // Do not call flash-resident functions
-              // while QSPI chip select is overridden.
               for (volatile int i = 0; i < 1000; ++i) {
                   __asm volatile("nop");
               }
@@ -165,7 +161,9 @@ jobs:
                   IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
               );
 
-              restore_interrupts(flags);
+              // This is the correct Pico SDK function
+              // for restoring the previous interrupt state.
+              restore_interrupts_from_disabled(flags);
 
               return pressed;
           }
@@ -179,7 +177,7 @@ jobs:
                   return;
               }
 
-              // Do not access BOOTSEL during startup.
+              // Do not read BOOTSEL during startup.
               if (
                   now - startedAt <
                   START_DELAY_US
@@ -212,11 +210,10 @@ jobs:
                   stablePressed = rawPressed;
 
                   // Switch the selected macro only after
-                  // the button has been released.
+                  // BOOTSEL has been released.
                   //
-                  // This guarantees:
-                  // first press  = Macro 6
-                  // second press = Macro 2
+                  // First press  = Macro 6
+                  // Second press = Macro 2
                   if (!stablePressed) {
                       if (
                           activeMacroMask ==
@@ -239,16 +236,14 @@ jobs:
                   MACRO_2_GPIO_MASK |
                   MACRO_6_GPIO_MASK;
 
-              // GP6 and GP7 are virtual macro inputs.
-              // Remove their physical GPIO states first.
-              //
-              // This makes GP6 and GP7 safe to leave
-              // disconnected or permanently grounded.
+              // GP6 and GP7 are used only as virtual
+              // macro inputs. Clear their real physical
+              // GPIO states first.
               gamepad->debouncedGpio &=
                   ~bothMacroMasks;
 
-              // While BOOTSEL is stably pressed,
-              // expose exactly one virtual macro pin.
+              // While BOOTSEL is pressed, expose exactly
+              // one virtual macro GPIO.
               if (stablePressed) {
                   gamepad->debouncedGpio |=
                       activeMacroMask;
@@ -325,7 +320,7 @@ jobs:
           new_available = r'''
           bool BootselButtonAddon::available() {
               // Always load this addon because it is also
-              // used as the BOOTSEL-to-macro bridge.
+              // used as the BOOTSEL macro bridge.
               return true;
           }
           '''
@@ -337,8 +332,7 @@ jobs:
                       .getAddonOptions()
                       .bootselButtonOptions;
 
-              // Preserve the official BOOTSEL button
-              // configuration if one exists.
+              // Preserve the official BOOTSEL button map.
               bootselButtonMap =
                   options.buttonMap;
           }
@@ -388,8 +382,8 @@ jobs:
 
               // Expose BOOTSEL as one virtual macro GPIO.
               //
-              // The official InputMacro addon will process
-              // this through its normal implementation.
+              // The official InputMacro addon continues
+              // to process macros using its original code.
               BootselMacroBridge::applyVirtualMacroPin(
                   gamepad
               );
@@ -417,22 +411,22 @@ jobs:
           path.write_text(source)
 
           print(
-              "BOOTSEL macro bridge patch applied"
+              "BOOTSEL macro bridge patch applied successfully"
           )
           print(
-              "Official input_macro.cpp unchanged"
+              "Official input_macro.cpp remains unchanged"
           )
           print(
-              "Official runCurrentMacro() unchanged"
+              "Official macro execution remains unchanged"
           )
           print(
-              "First press selects Macro 6"
+              "First BOOTSEL press selects Macro 6"
           )
           print(
-              "Second press selects Macro 2"
+              "Second BOOTSEL press selects Macro 2"
           )
           print(
-              "GP6 and GP7 physical states are ignored"
+              "Using restore_interrupts_from_disabled"
           )
           PY
 
@@ -454,6 +448,9 @@ jobs:
             src/addons/bootsel_button.cpp
 
           grep -q "readBootselForMacro" \
+            src/addons/bootsel_button.cpp
+
+          grep -q "restore_interrupts_from_disabled" \
             src/addons/bootsel_button.cpp
 
           grep -q "applyVirtualMacroPin" \
