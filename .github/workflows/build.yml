@@ -85,17 +85,84 @@ jobs:
                   "Cannot find BOOTSEL include anchor"
               )
 
+          # 先确保所有头文件出现在自定义代码之前。
+          include_block = include_anchor
+
           for include_line in required_includes:
               if include_line not in source:
-                  source = source.replace(
-                      include_anchor,
-                      include_anchor + "\n" + include_line,
-                      1,
-                  )
+                  include_block += "\n" + include_line
 
-          namespace_marker = (
+          # 删除可能由旧版本脚本插入的旧命名空间代码。
+          namespace_start = source.find(
               "namespace BootselMacroBridge"
           )
+
+          if namespace_start >= 0:
+              namespace_open = source.find(
+                  "{",
+                  namespace_start
+              )
+
+              if namespace_open < 0:
+                  raise SystemExit(
+                      "Broken BootselMacroBridge namespace"
+                  )
+
+              depth = 0
+              namespace_end = -1
+
+              for index in range(
+                  namespace_open,
+                  len(source)
+              ):
+                  character = source[index]
+
+                  if character == "{":
+                      depth += 1
+
+                  elif character == "}":
+                      depth -= 1
+
+                      if depth == 0:
+                          namespace_end = index + 1
+                          break
+
+              if namespace_end < 0:
+                  raise SystemExit(
+                      "Cannot close old BootselMacroBridge namespace"
+                  )
+
+              line_start = source.rfind(
+                  "\n",
+                  0,
+                  namespace_start
+              ) + 1
+
+              source = (
+                  source[:line_start] +
+                  source[namespace_end:]
+              )
+
+          # 确保 required includes 被放在所有函数和命名空间之前。
+          first_function = source.find(
+              "bool BootselButtonAddon::"
+          )
+
+          if first_function < 0:
+              raise SystemExit(
+                  "Cannot find BOOTSEL addon functions"
+              )
+
+          prefix = source[:first_function]
+
+          # 删除旧版本中可能残留的 required includes。
+          for include_line in required_includes:
+              prefix = prefix.replace(
+                  include_line + "\n",
+                  ""
+              )
+
+          prefix = prefix.rstrip()
 
           namespace_code = r'''
           namespace BootselMacroBridge {
@@ -122,7 +189,7 @@ jobs:
           bool rawPressed = false;
           bool stablePressed = false;
 
-          // First BOOTSEL press selects Macro 6.
+          // 第一次按下 BOOTSEL 使用 Macro 6。
           uint32_t activeMacroMask =
               MACRO_6_GPIO_MASK;
 
@@ -131,6 +198,7 @@ jobs:
           )() {
               const uint CS_PIN_INDEX = 1;
 
+              // 临时关闭中断，读取 QSPI BOOTSEL。
               uint32_t flags =
                   save_and_disable_interrupts();
 
@@ -143,15 +211,17 @@ jobs:
                   IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
               );
 
+              // 这里不能调用位于 Flash 中的函数。
               for (volatile int i = 0; i < 1000; ++i) {
                   __asm volatile("nop");
               }
 
-              // BOOTSEL is active low.
+              // BOOTSEL 为低电平有效。
               bool pressed =
                   !(sio_hw->gpio_hi_in &
                     (1u << CS_PIN_INDEX));
 
+              // 恢复 QSPI CS 引脚状态。
               hw_write_masked(
                   &ioqspi_hw
                       ->io[CS_PIN_INDEX]
@@ -161,9 +231,9 @@ jobs:
                   IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
               );
 
-              // This is the correct Pico SDK function
-              // for restoring the previous interrupt state.
-              restore_interrupts_from_disabled(flags);
+              // GP2040-CE v0.7.12 官方 Pico SDK
+              // 使用这个函数恢复中断状态。
+              restore_interrupts(flags);
 
               return pressed;
           }
@@ -177,7 +247,7 @@ jobs:
                   return;
               }
 
-              // Do not read BOOTSEL during startup.
+              // 启动后一秒才开始读取 BOOTSEL。
               if (
                   now - startedAt <
                   START_DELAY_US
@@ -209,11 +279,12 @@ jobs:
               ) {
                   stablePressed = rawPressed;
 
-                  // Switch the selected macro only after
-                  // BOOTSEL has been released.
+                  // 在释放 BOOTSEL 后切换到下一个宏。
                   //
-                  // First press  = Macro 6
-                  // Second press = Macro 2
+                  // 第一次按下：Macro 6
+                  // 第二次按下：Macro 2
+                  // 第三次按下：Macro 6
+                  // 第四次按下：Macro 2
                   if (!stablePressed) {
                       if (
                           activeMacroMask ==
@@ -236,14 +307,12 @@ jobs:
                   MACRO_2_GPIO_MASK |
                   MACRO_6_GPIO_MASK;
 
-              // GP6 and GP7 are used only as virtual
-              // macro inputs. Clear their real physical
-              // GPIO states first.
+              // 清除 GP6 和 GP7 的真实物理输入状态。
+              // 两个引脚可以保持悬空，不需要接地。
               gamepad->debouncedGpio &=
                   ~bothMacroMasks;
 
-              // While BOOTSEL is pressed, expose exactly
-              // one virtual macro GPIO.
+              // BOOTSEL 按下时，仅模拟一个宏引脚。
               if (stablePressed) {
                   gamepad->debouncedGpio |=
                       activeMacroMask;
@@ -253,14 +322,21 @@ jobs:
           }
           '''
 
-          if namespace_marker not in source:
-              source = source.replace(
-                  include_anchor,
-                  include_anchor +
-                  "\n" +
-                  namespace_code,
-                  1,
-              )
+          # 重新构造文件：
+          # 官方头文件
+          # 自定义命名空间
+          # 官方函数
+          rebuilt_prefix = (
+              include_block +
+              "\n\n" +
+              namespace_code.strip() +
+              "\n\n"
+          )
+
+          source = (
+              rebuilt_prefix +
+              source[first_function:]
+          )
 
           def replace_function(
               text,
@@ -277,7 +353,7 @@ jobs:
 
               opening_brace = text.find(
                   "{",
-                  start,
+                  start
               )
 
               if opening_brace < 0:
@@ -291,7 +367,7 @@ jobs:
 
               for index in range(
                   opening_brace,
-                  len(text),
+                  len(text)
               ):
                   character = text[index]
 
@@ -319,8 +395,8 @@ jobs:
 
           new_available = r'''
           bool BootselButtonAddon::available() {
-              // Always load this addon because it is also
-              // used as the BOOTSEL macro bridge.
+              // 即使网页中没有配置官方 BOOTSEL 按钮，
+              // 也必须加载该插件来提供宏桥接。
               return true;
           }
           '''
@@ -332,7 +408,7 @@ jobs:
                       .getAddonOptions()
                       .bootselButtonOptions;
 
-              // Preserve the official BOOTSEL button map.
+              // 保留官方 BOOTSEL 按钮映射。
               bootselButtonMap =
                   options.buttonMap;
           }
@@ -346,8 +422,7 @@ jobs:
 
               BootselMacroBridge::update();
 
-              // Preserve the official BOOTSEL button
-              // behavior when a button map is configured.
+              // 保留官方 BOOTSEL 按钮功能。
               if (
                   BootselMacroBridge::stablePressed &&
                   bootselButtonMap != 0
@@ -380,10 +455,7 @@ jobs:
                   }
               }
 
-              // Expose BOOTSEL as one virtual macro GPIO.
-              //
-              // The official InputMacro addon continues
-              // to process macros using its original code.
+              // 将 BOOTSEL 转换为 GP6 或 GP7 的虚拟宏输入。
               BootselMacroBridge::applyVirtualMacroPin(
                   gamepad
               );
@@ -393,19 +465,19 @@ jobs:
           source = replace_function(
               source,
               "bool BootselButtonAddon::available()",
-              new_available,
+              new_available
           )
 
           source = replace_function(
               source,
               "void BootselButtonAddon::setup()",
-              new_setup,
+              new_setup
           )
 
           source = replace_function(
               source,
               "void BootselButtonAddon::preprocess()",
-              new_preprocess,
+              new_preprocess
           )
 
           path.write_text(source)
@@ -414,23 +486,23 @@ jobs:
               "BOOTSEL macro bridge patch applied successfully"
           )
           print(
+              "All SDK headers are before custom code"
+          )
+          print(
+              "Using restore_interrupts(flags)"
+          )
+          print(
               "Official input_macro.cpp remains unchanged"
           )
           print(
-              "Official macro execution remains unchanged"
+              "First press selects Macro 6"
           )
           print(
-              "First BOOTSEL press selects Macro 6"
-          )
-          print(
-              "Second BOOTSEL press selects Macro 2"
-          )
-          print(
-              "Using restore_interrupts_from_disabled"
+              "Second press selects Macro 2"
           )
           PY
 
-      - name: Verify BOOTSEL macro bridge
+      - name: Verify BOOTSEL patch order
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -450,7 +522,7 @@ jobs:
           grep -q "readBootselForMacro" \
             src/addons/bootsel_button.cpp
 
-          grep -q "restore_interrupts_from_disabled" \
+          grep -q "restore_interrupts(flags)" \
             src/addons/bootsel_button.cpp
 
           grep -q "applyVirtualMacroPin" \
@@ -461,7 +533,56 @@ jobs:
 
           test -f src/addons/input_macro.cpp
 
-          echo "BOOTSEL macro bridge verification passed"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path(
+              "src/addons/bootsel_button.cpp"
+          ).read_text()
+
+          namespace_position = source.find(
+              "namespace BootselMacroBridge"
+          )
+
+          sync_position = source.find(
+              '#include "hardware/sync.h"'
+          )
+
+          qspi_position = source.find(
+              '#include "hardware/structs/ioqspi.h"'
+          )
+
+          if sync_position < 0:
+              raise SystemExit(
+                  "hardware/sync.h is missing"
+              )
+
+          if qspi_position < 0:
+              raise SystemExit(
+                  "hardware/structs/ioqspi.h is missing"
+              )
+
+          if namespace_position < 0:
+              raise SystemExit(
+                  "BootselMacroBridge is missing"
+              )
+
+          if sync_position > namespace_position:
+              raise SystemExit(
+                  "hardware/sync.h appears after custom code"
+              )
+
+          if qspi_position > namespace_position:
+              raise SystemExit(
+                  "ioqspi.h appears after custom code"
+              )
+
+          print(
+              "Header order verification passed"
+          )
+          PY
+
+          echo "BOOTSEL patch verification passed"
 
       - name: Configure Pico firmware
         working-directory: gp2040-ce
@@ -502,9 +623,11 @@ jobs:
 
           if [ -z "$UF2_FILE" ]; then
             echo "No UF2 file was generated"
+
             find gp2040-ce/build \
               -type f \
               | sort
+
             exit 1
           fi
 
