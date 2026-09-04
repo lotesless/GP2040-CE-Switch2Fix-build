@@ -1,4 +1,4 @@
-name: Build Official GP2040-CE Pico
+name: Build GP2040-CE BOOTSEL Macro 2-6 Stable
 
 on:
   workflow_dispatch:
@@ -48,28 +48,247 @@ jobs:
           npm ci
           CI=false npm run build
 
-      - name: Verify official web filesystem
+      - name: Verify web filesystem
         working-directory: gp2040-ce
         shell: bash
         run: |
           set -euo pipefail
 
           test -f lib/httpd/fsdata.c
+          echo "Official web filesystem generated successfully"
 
-          echo "Official fsdata.c exists"
+      - name: Install stable BOOTSEL bridge
+        working-directory: gp2040-ce
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Verify official source is unmodified
+          cat > src/addons/bootsel_button.cpp <<'CPP'
+          #include "addons/bootsel_button.h"
+          #include "storagemanager.h"
+          #include "hardware/gpio.h"
+          #include "hardware/sync.h"
+          #include "hardware/structs/ioqspi.h"
+          #include "hardware/structs/sio.h"
+          #include "helper.h"
+          #include "config.pb.h"
+
+          namespace {
+              constexpr uint32_t MACRO_2_GPIO_MASK =
+                  1u << 6;
+
+              constexpr uint32_t MACRO_6_GPIO_MASK =
+                  1u << 7;
+
+              constexpr uint64_t POLL_INTERVAL_US =
+                  40000;
+
+              constexpr uint64_t DEBOUNCE_INTERVAL_US =
+                  30000;
+
+              uint64_t lastBootselPollTime = 0;
+              uint64_t bootselChangedTime = 0;
+
+              bool rawBootselPressed = false;
+              bool stableBootselPressed = false;
+
+              // First press runs Macro 6.
+              uint32_t selectedMacroPin =
+                  MACRO_6_GPIO_MASK;
+          }
+
+          bool __no_inline_not_in_flash_func(
+              BootselButtonAddon::isBootselPressed
+          )() {
+              const uint CS_PIN_INDEX = 1;
+
+              // This is the official GP2040-CE BOOTSEL
+              // implementation for RP2040.
+              uint32_t flags =
+                  save_and_disable_interrupts();
+
+              hw_write_masked(
+                  &ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                  GPIO_OVERRIDE_LOW
+                      << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                  IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
+              );
+
+              for (volatile int i = 0; i < 1000; ++i) {
+                  __asm volatile("nop");
+              }
+
+              // BOOTSEL is active low.
+              bool buttonState =
+                  !(sio_hw->gpio_hi_in &
+                    (1u << CS_PIN_INDEX));
+
+              hw_write_masked(
+                  &ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                  GPIO_OVERRIDE_NORMAL
+                      << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                  IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
+              );
+
+              restore_interrupts(flags);
+
+              return buttonState;
+          }
+
+          bool BootselButtonAddon::available() {
+              // Always load the addon because it also
+              // provides the BOOTSEL-to-macro bridge.
+              return true;
+          }
+
+          void BootselButtonAddon::setup() {
+              const BootselButtonOptions& options =
+                  Storage::getInstance()
+                      .getAddonOptions()
+                      .bootselButtonOptions;
+
+              // Preserve the official BOOTSEL button map.
+              bootselButtonMap =
+                  options.buttonMap;
+
+              lastBootselPollTime = 0;
+              bootselChangedTime = 0;
+
+              rawBootselPressed = false;
+              stableBootselPressed = false;
+
+              // First press: Macro 6.
+              selectedMacroPin =
+                  MACRO_6_GPIO_MASK;
+          }
+
+          void BootselButtonAddon::preprocess() {
+              Gamepad* gamepad =
+                  Storage::getInstance().GetGamepad();
+
+              uint64_t now = getMicro();
+
+              bool shouldPoll =
+                  lastBootselPollTime == 0 ||
+                  now - lastBootselPollTime >=
+                      POLL_INTERVAL_US;
+
+              if (shouldPoll) {
+                  lastBootselPollTime = now;
+
+                  // Read BOOTSEL exactly once per poll.
+                  bool currentRawPressed =
+                      isBootselPressed();
+
+                  if (
+                      currentRawPressed !=
+                      rawBootselPressed
+                  ) {
+                      rawBootselPressed =
+                          currentRawPressed;
+
+                      bootselChangedTime = now;
+                  }
+
+                  bool debounceComplete =
+                      now - bootselChangedTime >=
+                      DEBOUNCE_INTERVAL_US;
+
+                  if (
+                      debounceComplete &&
+                      stableBootselPressed !=
+                          rawBootselPressed
+                  ) {
+                      stableBootselPressed =
+                          rawBootselPressed;
+
+                      // Change macro only after the
+                      // current BOOTSEL press is released.
+                      if (!stableBootselPressed) {
+                          if (
+                              selectedMacroPin ==
+                              MACRO_6_GPIO_MASK
+                          ) {
+                              selectedMacroPin =
+                                  MACRO_2_GPIO_MASK;
+                          } else {
+                              selectedMacroPin =
+                                  MACRO_6_GPIO_MASK;
+                          }
+                      }
+                  }
+              }
+
+              // Preserve the official BOOTSEL button map.
+              if (
+                  stableBootselPressed &&
+                  bootselButtonMap != 0
+              ) {
+                  switch (bootselButtonMap) {
+                      case GAMEPAD_MASK_DU:
+                          gamepad->state.dpad |=
+                              GAMEPAD_MASK_UP;
+                          break;
+
+                      case GAMEPAD_MASK_DD:
+                          gamepad->state.dpad |=
+                              GAMEPAD_MASK_DOWN;
+                          break;
+
+                      case GAMEPAD_MASK_DL:
+                          gamepad->state.dpad |=
+                              GAMEPAD_MASK_LEFT;
+                          break;
+
+                      case GAMEPAD_MASK_DR:
+                          gamepad->state.dpad |=
+                              GAMEPAD_MASK_RIGHT;
+                          break;
+
+                      default:
+                          gamepad->state.buttons |=
+                              bootselButtonMap;
+                          break;
+                  }
+              }
+
+              // Clear physical states of GP6 and GP7.
+              //
+              // They are used as virtual macro inputs.
+              // Do not connect either pin to ground.
+              const uint32_t bothMacroPins =
+                  MACRO_2_GPIO_MASK |
+                  MACRO_6_GPIO_MASK;
+
+              gamepad->debouncedGpio &=
+                  ~bothMacroPins;
+
+              // While BOOTSEL is held, expose only one
+              // virtual macro input to the official
+              // InputMacro implementation.
+              if (stableBootselPressed) {
+                  gamepad->debouncedGpio |=
+                      selectedMacroPin;
+              }
+          }
+          CPP
+
+          echo "Stable BOOTSEL bridge installed"
+
+      - name: Verify stable BOOTSEL bridge
         working-directory: gp2040-ce
         shell: bash
         run: |
           set -euo pipefail
 
           test -f src/addons/bootsel_button.cpp
-          test -f src/addons/input_macro.cpp
-          test -f headers/addons/bootsel_button.h
 
           grep -q \
             "BootselButtonAddon::isBootselPressed" \
+            src/addons/bootsel_button.cpp
+
+          grep -q \
+            "save_and_disable_interrupts" \
             src/addons/bootsel_button.cpp
 
           grep -q \
@@ -77,30 +296,58 @@ jobs:
             src/addons/bootsel_button.cpp
 
           grep -q \
-            "InputMacro::runCurrentMacro" \
-            src/addons/input_macro.cpp
+            "MACRO_2_GPIO_MASK" \
+            src/addons/bootsel_button.cpp
+
+          grep -q \
+            "MACRO_6_GPIO_MASK" \
+            src/addons/bootsel_button.cpp
+
+          grep -q \
+            "POLL_INTERVAL_US" \
+            src/addons/bootsel_button.cpp
+
+          grep -q \
+            "DEBOUNCE_INTERVAL_US" \
+            src/addons/bootsel_button.cpp
+
+          grep -q \
+            "selectedMacroPin" \
+            src/addons/bootsel_button.cpp
+
+          grep -q \
+            "gamepad->debouncedGpio" \
+            src/addons/bootsel_button.cpp
 
           if grep -q \
-            "BootselMacroBridge" \
+            "namespace BootselMacroBridge" \
             src/addons/bootsel_button.cpp; then
-            echo "Unexpected custom BOOTSEL patch detected"
+            echo "Old BOOTSEL bridge code was not removed"
             exit 1
           fi
 
           if grep -q \
             "readBootselForMacro" \
             src/addons/bootsel_button.cpp; then
-            echo "Unexpected custom BOOTSEL reader detected"
+            echo "Old custom BOOTSEL reader was not removed"
             exit 1
           fi
 
-          echo "Official source verification passed"
+          test -f src/addons/input_macro.cpp
 
-      - name: Configure official Pico firmware
+          grep -q \
+            "InputMacro::runCurrentMacro" \
+            src/addons/input_macro.cpp
+
+          echo "Stable BOOTSEL bridge verification passed"
+
+      - name: Configure Pico firmware
         working-directory: gp2040-ce
         shell: bash
         run: |
           set -euo pipefail
+
+          test -d "$GITHUB_WORKSPACE/pico-sdk"
 
           export PICO_SDK_PATH="$GITHUB_WORKSPACE/pico-sdk"
           export GP2040_BOARDCONFIG=Pico
@@ -110,7 +357,7 @@ jobs:
             -B build \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build official Pico firmware
+      - name: Build Pico firmware
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -143,10 +390,10 @@ jobs:
             exit 1
           fi
 
-          echo "Generated official UF2:"
+          echo "Generated UF2:"
           echo "$UF2_FILE"
 
-      - name: Package official UF2
+      - name: Package UF2
         shell: bash
         run: |
           set -euo pipefail
@@ -165,17 +412,17 @@ jobs:
 
           cp \
             "$UF2_FILE" \
-            GP2040-CE-Official-v0.7.12-Pico.uf2
+            GP2040-CE-Pico-BOOTSEL-Stable-Macro2-Macro6.uf2
 
           sha256sum \
-            GP2040-CE-Official-v0.7.12-Pico.uf2 \
+            GP2040-CE-Pico-BOOTSEL-Stable-Macro2-Macro6.uf2 \
             > SHA256SUMS.txt
 
-      - name: Upload official UF2 artifact
+      - name: Upload UF2 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GP2040-CE-Official-v0.7.12-Pico
+          name: GP2040-CE-Pico-BOOTSEL-Stable-Macro2-Macro6
           path: |
-            GP2040-CE-Official-v0.7.12-Pico.uf2
+            GP2040-CE-Pico-BOOTSEL-Stable-Macro2-Macro6.uf2
             SHA256SUMS.txt
           if-no-files-found: error
