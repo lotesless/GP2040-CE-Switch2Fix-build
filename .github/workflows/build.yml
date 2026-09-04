@@ -1,4 +1,4 @@
-name: Build GP2040-CE Switch2 Auto A Macro
+name: Build GP2040-CE v0.7.12 Switch 2 Fix Auto A
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   UPSTREAM_REF: v0.7.12
@@ -20,7 +20,7 @@ jobs:
       - name: Checkout build repository
         uses: actions/checkout@v4
 
-      - name: Checkout official GP2040-CE source
+      - name: Checkout GP2040-CE source
         uses: actions/checkout@v4
         with:
           repository: OpenStickCommunity/GP2040-CE
@@ -29,138 +29,131 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20.x"
-          cache: npm
-          cache-dependency-path: gp2040-ce/www/package-lock.json
-
       - name: Setup Raspberry Pi Pico SDK
         uses: Fortinbra/RaspberryPiPicoBuild@v7
 
-      - name: Verify Pico SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          test -d "$GITHUB_WORKSPACE/pico-sdk"
-          test -f "$GITHUB_WORKSPACE/pico-sdk/pico_sdk_init.cmake"
-
-          echo "Pico SDK is available:"
-          echo "$GITHUB_WORKSPACE/pico-sdk"
-
-      - name: Build official web assets
-        working-directory: gp2040-ce/www
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          npm ci
-          CI=false npm run build
-
-      - name: Verify web filesystem
+      - name: Apply stable Switch 2 fix and automatic A
         working-directory: gp2040-ce
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f lib/httpd/fsdata.c
+          python3 - <<'PY'
+          from pathlib import Path
 
-          echo "Official web filesystem generated successfully"
+          macro_file = Path("src/addons/input_macro.cpp")
+          macro_source = macro_file.read_text()
 
-      - name: Install BOOTSEL bridge and automatic A sequence
-        working-directory: gp2040-ce
-        shell: bash
-        run: |
-          set -euo pipefail
+          required_includes = [
+              '#include "hardware/sync.h"',
+              '#include "hardware/structs/ioqspi.h"',
+              '#include "hardware/structs/sio.h"',
+          ]
 
-          cat > src/addons/bootsel_button.cpp <<'CPP'
-          #include "addons/bootsel_button.h"
-          #include "storagemanager.h"
-          #include "hardware/gpio.h"
-          #include "hardware/sync.h"
-          #include "hardware/structs/ioqspi.h"
-          #include "hardware/structs/sio.h"
-          #include "helper.h"
-          #include "config.pb.h"
+          gpio_include = '#include "hardware/gpio.h"'
 
-          namespace {
-              constexpr uint32_t MACRO_2_GPIO_MASK =
-                  1u << 6;
+          if gpio_include not in macro_source:
+              raise SystemExit(
+                  "Cannot find hardware/gpio.h include"
+              )
 
-              constexpr uint32_t MACRO_6_GPIO_MASK =
-                  1u << 7;
+          for include_line in required_includes:
+              if include_line not in macro_source:
+                  macro_source = macro_source.replace(
+                      gpio_include,
+                      gpio_include +
+                      "\n" +
+                      include_line,
+                      1,
+                  )
 
-              // Wait two seconds after firmware startup
-              // before sending the automatic A sequence.
-              constexpr uint64_t AUTO_A_START_DELAY_US =
-                  2000000;
+          available_marker = (
+              "bool InputMacro::available() {"
+          )
 
-              // Start one A press every 500 milliseconds.
-              constexpr uint64_t AUTO_A_INTERVAL_US =
-                  500000;
+          if available_marker not in macro_source:
+              raise SystemExit(
+                  "InputMacro::available marker not found"
+              )
 
-              // Hold A for 120 milliseconds.
-              constexpr uint64_t AUTO_A_HOLD_US =
-                  120000;
+          helper_marker = (
+              "namespace Switch2FixSupport"
+          )
 
-              constexpr uint8_t AUTO_A_PRESS_COUNT =
-                  3;
+          helper_code = r'''
+          namespace Switch2FixSupport {
 
-              // Read BOOTSEL at a limited frequency.
-              constexpr uint64_t BOOTSEL_POLL_INTERVAL_US =
-                  40000;
+          constexpr uint64_t BOOTSEL_START_DELAY_US =
+              1000000;
 
-              constexpr uint64_t BOOTSEL_DEBOUNCE_US =
-                  30000;
+          constexpr uint64_t BOOTSEL_POLL_INTERVAL_US =
+              20000;
 
-              uint64_t firmwareStartTime = 0;
-              uint64_t lastBootselPollTime = 0;
-              uint64_t bootselChangedTime = 0;
+          constexpr uint64_t BOOTSEL_DEBOUNCE_US =
+              30000;
 
-              bool rawBootselPressed = false;
-              bool stableBootselPressed = false;
+          constexpr int MACRO_2_INDEX = 1;
+          constexpr int MACRO_6_INDEX = 5;
 
-              // The first BOOTSEL press triggers Macro 6.
-              uint32_t selectedMacroPin =
-                  MACRO_6_GPIO_MASK;
+          constexpr uint64_t AUTO_A_START_DELAY_US =
+              1000000;
 
-              uint8_t autoAPressCount = 0;
-          }
+          constexpr uint64_t AUTO_A_INTERVAL_US =
+              500000;
+
+          constexpr uint64_t AUTO_A_HOLD_US =
+              120000;
+
+          constexpr int AUTO_A_PRESS_COUNT = 3;
+
+          uint64_t bootselStartTime = 0;
+          uint64_t bootselLastPollTime = 0;
+          uint64_t bootselChangedTime = 0;
+
+          bool bootselRawState = false;
+          bool bootselStableState = false;
+          bool bootselEdgeState = false;
+
+          int selectedMacro =
+              MACRO_6_INDEX;
+
+          uint64_t autoAStartTime = 0;
+          int autoAPressCount = 0;
 
           bool __no_inline_not_in_flash_func(
-              BootselButtonAddon::isBootselPressed
+              readBootselButton
           )() {
               const uint CS_PIN_INDEX = 1;
 
-              // Disable interrupts because flash access
-              // is temporarily unavailable while reading
-              // the RP2040 BOOTSEL button.
+              // BOOTSEL temporarily disables flash access.
+              // Interrupts must remain disabled during
+              // the complete QSPI read sequence.
               uint32_t flags =
                   save_and_disable_interrupts();
 
               hw_write_masked(
-                  &ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                  &ioqspi_hw
+                      ->io[CS_PIN_INDEX]
+                      .ctrl,
                   GPIO_OVERRIDE_LOW
                       << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
                   IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
               );
 
-              // Do not call flash-resident delay functions
-              // while QSPI chip select is overridden.
+              // Do not call sleep functions here.
               for (volatile int i = 0; i < 1000; ++i) {
                   __asm volatile("nop");
               }
 
               // BOOTSEL is active low.
-              bool buttonState =
+              bool pressed =
                   !(sio_hw->gpio_hi_in &
                     (1u << CS_PIN_INDEX));
 
-              // Restore normal QSPI chip-select operation.
               hw_write_masked(
-                  &ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                  &ioqspi_hw
+                      ->io[CS_PIN_INDEX]
+                      .ctrl,
                   GPIO_OVERRIDE_NORMAL
                       << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
                   IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
@@ -168,272 +161,332 @@ jobs:
 
               restore_interrupts(flags);
 
-              return buttonState;
+              return pressed;
           }
 
-          bool BootselButtonAddon::available() {
-              // Always load this addon because it provides
-              // the automatic A sequence and BOOTSEL macro
-              // switching.
-              return true;
+          void resetBootselState() {
+              bootselStartTime = 0;
+              bootselLastPollTime = 0;
+              bootselChangedTime = 0;
+
+              bootselRawState = false;
+              bootselStableState = false;
+              bootselEdgeState = false;
+
+              selectedMacro =
+                  MACRO_6_INDEX;
           }
 
-          void BootselButtonAddon::setup() {
-              const BootselButtonOptions& options =
-                  Storage::getInstance()
-                      .getAddonOptions()
-                      .bootselButtonOptions;
+          void updateBootselMacroSelector() {
+              uint64_t now = getMicro();
 
-              // Preserve the configured official BOOTSEL
-              // button mapping.
-              bootselButtonMap =
-                  options.buttonMap;
+              if (bootselStartTime == 0) {
+                  bootselStartTime = now;
+                  bootselChangedTime = now;
+                  return;
+              }
 
-              firmwareStartTime =
-                  getMicro();
+              // Do not read BOOTSEL immediately after
+              // firmware startup. This is important for
+              // stable Switch 2 USB initialization.
+              if (
+                  now - bootselStartTime <
+                  BOOTSEL_START_DELAY_US
+              ) {
+                  return;
+              }
 
-              lastBootselPollTime = 0;
-              bootselChangedTime =
-                  firmwareStartTime;
+              if (
+                  now - bootselLastPollTime <
+                  BOOTSEL_POLL_INTERVAL_US
+              ) {
+                  return;
+              }
 
-              rawBootselPressed = false;
-              stableBootselPressed = false;
+              bootselLastPollTime = now;
 
-              selectedMacroPin =
-                  MACRO_6_GPIO_MASK;
+              bool rawState =
+                  readBootselButton();
 
+              if (rawState != bootselRawState) {
+                  bootselRawState = rawState;
+                  bootselChangedTime = now;
+              }
+
+              if (
+                  now - bootselChangedTime >=
+                      BOOTSEL_DEBOUNCE_US &&
+                  rawState != bootselStableState
+              ) {
+                  bootselStableState = rawState;
+
+                  // Switch the macro on the BOOTSEL
+                  // press edge, not on release.
+                  //
+                  // This preserves the behavior of
+                  // the early working Switch 2 version.
+                  if (
+                      bootselStableState &&
+                      !bootselEdgeState
+                  ) {
+                      selectedMacro =
+                          selectedMacro ==
+                              MACRO_6_INDEX
+                              ? MACRO_2_INDEX
+                              : MACRO_6_INDEX;
+                  }
+
+                  bootselEdgeState =
+                      bootselStableState;
+              }
+          }
+
+          void resetAutomaticASequence() {
+              autoAStartTime = 0;
               autoAPressCount = 0;
           }
 
-          void BootselButtonAddon::preprocess() {
-              Gamepad* gamepad =
-                  Storage::getInstance().GetGamepad();
+          void runAutomaticASequence(
+              Gamepad* gamepad
+          ) {
+              uint64_t now = getMicro();
 
-              uint64_t now =
-                  getMicro();
+              if (autoAStartTime == 0) {
+                  autoAStartTime = now;
+                  return;
+              }
 
-              uint64_t elapsed =
-                  now - firmwareStartTime;
-
-              /*
-               * Automatic A sequence:
-               *
-               * 2.0 seconds: first A
-               * 2.5 seconds: second A
-               * 3.0 seconds: third A
-               *
-               * Each A press lasts 120 milliseconds.
-               */
               if (
-                  autoAPressCount <
+                  autoAPressCount >=
                   AUTO_A_PRESS_COUNT
               ) {
-                  uint64_t pressStart =
-                      AUTO_A_START_DELAY_US +
-                      (
-                          static_cast<uint64_t>(
-                              autoAPressCount
-                          ) *
-                          AUTO_A_INTERVAL_US
-                      );
-
-                  uint64_t pressEnd =
-                      pressStart +
-                      AUTO_A_HOLD_US;
-
-                  if (
-                      elapsed >= pressStart &&
-                      elapsed < pressEnd
-                  ) {
-                      // GP2040-CE primary face button.
-                      // In Nintendo Switch mode this is
-                      // normally reported as A.
-                      gamepad->state.buttons |=
-                          GAMEPAD_MASK_B1;
-                  }
-
-                  if (elapsed >= pressEnd) {
-                      autoAPressCount++;
-                  }
+                  return;
               }
 
-              /*
-               * BOOTSEL polling and debounce.
-               */
-              bool shouldPoll =
-                  lastBootselPollTime == 0 ||
-                  now - lastBootselPollTime >=
-                      BOOTSEL_POLL_INTERVAL_US;
+              uint64_t elapsed =
+                  now - autoAStartTime;
 
-              if (shouldPoll) {
-                  lastBootselPollTime =
-                      now;
+              uint64_t pressStart =
+                  AUTO_A_START_DELAY_US +
+                  (
+                      static_cast<uint64_t>(
+                          autoAPressCount
+                      ) *
+                      AUTO_A_INTERVAL_US
+                  );
 
-                  bool currentRawPressed =
-                      isBootselPressed();
+              uint64_t pressEnd =
+                  pressStart +
+                  AUTO_A_HOLD_US;
 
-                  if (
-                      currentRawPressed !=
-                      rawBootselPressed
-                  ) {
-                      rawBootselPressed =
-                          currentRawPressed;
-
-                      bootselChangedTime =
-                          now;
-                  }
-
-                  bool debounceComplete =
-                      now - bootselChangedTime >=
-                      BOOTSEL_DEBOUNCE_US;
-
-                  if (
-                      debounceComplete &&
-                      stableBootselPressed !=
-                          rawBootselPressed
-                  ) {
-                      stableBootselPressed =
-                          rawBootselPressed;
-
-                      /*
-                       * Switch to the next macro only
-                       * after BOOTSEL is released.
-                       *
-                       * First press:  Macro 6
-                       * Second press: Macro 2
-                       * Third press:  Macro 6
-                       */
-                      if (!stableBootselPressed) {
-                          if (
-                              selectedMacroPin ==
-                              MACRO_6_GPIO_MASK
-                          ) {
-                              selectedMacroPin =
-                                  MACRO_2_GPIO_MASK;
-                          } else {
-                              selectedMacroPin =
-                                  MACRO_6_GPIO_MASK;
-                          }
-                      }
-                  }
-              }
-
-              /*
-               * Preserve the official BOOTSEL button
-               * mapping when one is configured.
-               */
               if (
-                  stableBootselPressed &&
-                  bootselButtonMap != 0
+                  elapsed >= pressStart &&
+                  elapsed < pressEnd
               ) {
-                  switch (bootselButtonMap) {
-                      case GAMEPAD_MASK_DU:
-                          gamepad->state.dpad |=
-                              GAMEPAD_MASK_UP;
-                          break;
-
-                      case GAMEPAD_MASK_DD:
-                          gamepad->state.dpad |=
-                              GAMEPAD_MASK_DOWN;
-                          break;
-
-                      case GAMEPAD_MASK_DL:
-                          gamepad->state.dpad |=
-                              GAMEPAD_MASK_LEFT;
-                          break;
-
-                      case GAMEPAD_MASK_DR:
-                          gamepad->state.dpad |=
-                              GAMEPAD_MASK_RIGHT;
-                          break;
-
-                      default:
-                          gamepad->state.buttons |=
-                              bootselButtonMap;
-                          break;
-                  }
+                  // B1 is the primary face button
+                  // and is normally reported as A
+                  // in Nintendo Switch mode.
+                  gamepad->state.buttons |=
+                      GAMEPAD_MASK_B1;
               }
 
-              /*
-               * GP6 and GP7 are virtual macro inputs:
-               *
-               * GP6 = Macro 2
-               * GP7 = Macro 6
-               *
-               * Clear their physical GPIO states first.
-               */
-              const uint32_t bothMacroPins =
-                  MACRO_2_GPIO_MASK |
-                  MACRO_6_GPIO_MASK;
-
-              gamepad->debouncedGpio &=
-                  ~bothMacroPins;
-
-              // Present exactly one virtual macro input
-              // while BOOTSEL is pressed.
-              if (stableBootselPressed) {
-                  gamepad->debouncedGpio |=
-                      selectedMacroPin;
+              if (elapsed >= pressEnd) {
+                  autoAPressCount++;
               }
           }
-          CPP
 
-          echo "BOOTSEL bridge and automatic A sequence installed"
+          }
+          '''
 
-      - name: Verify BOOTSEL and automatic A patch
+          if helper_marker not in macro_source:
+              macro_source = macro_source.replace(
+                  available_marker,
+                  helper_code.strip() +
+                  "\n\n" +
+                  available_marker,
+                  1,
+              )
+
+          old_trigger_block = '''    // Go through our macro list
+          pressedMacro = -1;
+          for(int i = 0; i < MAX_MACRO_LIMIT; i++) {'''
+
+          new_trigger_block = '''    updateBootselMacroSelector();
+
+          // BOOTSEL selects Macro 6 or Macro 2.
+          //
+          // The official macro pin configuration is
+          // retained. The selected macro is injected
+          // into the normal InputMacro path.
+          if (
+              macroPinMasks[MACRO_2_INDEX] &&
+              macroPinMasks[MACRO_6_INDEX] &&
+              (
+                  allPins &
+                  macroPinMasks[MACRO_2_INDEX]
+              )
+          ) {
+              pressedMacro =
+                  selectedMacro;
+
+              return;
+          }
+
+          // Go through our macro list
+          pressedMacro = -1;
+          for(int i = 0; i < MAX_MACRO_LIMIT; i++) {'''
+
+          if old_trigger_block not in macro_source:
+              raise SystemExit(
+                  "InputMacro trigger block not found"
+              )
+
+          macro_source = macro_source.replace(
+              old_trigger_block,
+              new_trigger_block,
+              1,
+          )
+
+          preprocess_marker = (
+              "void InputMacro::preprocess()\n{"
+          )
+
+          if preprocess_marker not in macro_source:
+              preprocess_marker = (
+                  "void InputMacro::preprocess()\r\n{"
+              )
+
+          if preprocess_marker not in macro_source:
+              raise SystemExit(
+                  "InputMacro::preprocess marker not found"
+              )
+
+          auto_a_call = '''
+          {
+              Gamepad* gamepad =
+                  Storage::getInstance()
+                      .GetGamepad();
+
+              Switch2FixSupport::runAutomaticASequence(
+                  gamepad
+              );
+          }
+
+          '''
+
+          macro_source = macro_source.replace(
+              preprocess_marker,
+              preprocess_marker +
+              auto_a_call,
+              1,
+          )
+
+          macro_file.write_text(macro_source)
+
+          # Disable the original BOOTSEL addon.
+          #
+          # The custom BOOTSEL selector above is deliberately
+          # located in input_macro.cpp because the early
+          # Switch 2 Fix version used this architecture and
+          # was able to enumerate on Switch 2.
+          bootsel_file = Path(
+              "src/addons/bootsel_button.cpp"
+          )
+
+          bootsel_file.write_text(
+              '#include "addons/bootsel_button.h"\n\n'
+              'bool BootselButtonAddon::available() '
+              '{ return false; }\n'
+              'void BootselButtonAddon::setup() {}\n'
+              'void BootselButtonAddon::preprocess() {}\n'
+          )
+
+          print(
+              "Stable early Switch 2 architecture installed"
+          )
+          print(
+              "Original BOOTSEL addon disabled"
+          )
+          print(
+              "BOOTSEL polling starts after one second"
+          )
+          print(
+              "BOOTSEL polling interval: 20 ms"
+          )
+          print(
+              "BOOTSEL debounce: 30 ms"
+          )
+          print(
+              "Automatic A sequence added"
+          )
+          print(
+              "Automatic A count: 3"
+          )
+          print(
+              "Automatic A interval: 500 ms"
+          )
+          PY
+
+      - name: Verify Switch 2 fix source
         working-directory: gp2040-ce
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f src/addons/bootsel_button.cpp
           test -f src/addons/input_macro.cpp
+          test -f src/addons/bootsel_button.cpp
 
           grep -q \
-            "BootselButtonAddon::isBootselPressed" \
-            src/addons/bootsel_button.cpp
+            "namespace Switch2FixSupport" \
+            src/addons/input_macro.cpp
 
           grep -q \
-            "save_and_disable_interrupts" \
-            src/addons/bootsel_button.cpp
+            "readBootselButton" \
+            src/addons/input_macro.cpp
 
           grep -q \
-            "restore_interrupts(flags)" \
-            src/addons/bootsel_button.cpp
-
-          grep -q \
-            "GAMEPAD_MASK_B1" \
-            src/addons/bootsel_button.cpp
+            "updateBootselMacroSelector" \
+            src/addons/input_macro.cpp
 
           grep -q \
             "AUTO_A_PRESS_COUNT" \
-            src/addons/bootsel_button.cpp
+            src/addons/input_macro.cpp
 
           grep -q \
             "AUTO_A_INTERVAL_US" \
-            src/addons/bootsel_button.cpp
+            src/addons/input_macro.cpp
 
           grep -q \
             "AUTO_A_HOLD_US" \
-            src/addons/bootsel_button.cpp
+            src/addons/input_macro.cpp
 
           grep -q \
-            "MACRO_2_GPIO_MASK" \
-            src/addons/bootsel_button.cpp
-
-          grep -q \
-            "MACRO_6_GPIO_MASK" \
-            src/addons/bootsel_button.cpp
-
-          grep -q \
-            "gamepad->debouncedGpio" \
-            src/addons/bootsel_button.cpp
+            "GAMEPAD_MASK_B1" \
+            src/addons/input_macro.cpp
 
           grep -q \
             "InputMacro::runCurrentMacro" \
             src/addons/input_macro.cpp
 
-          echo "BOOTSEL and automatic A patch verification passed"
+          grep -q \
+            "return false" \
+            src/addons/bootsel_button.cpp
+
+          if grep -q \
+            "BootselMacroBridge" \
+            src/addons/bootsel_button.cpp; then
+            echo "Unexpected old BOOTSEL bridge remains"
+            exit 1
+          fi
+
+          if grep -q \
+            "readBootselForMacro" \
+            src/addons/bootsel_button.cpp; then
+            echo "Unexpected old BOOTSEL reader remains"
+            exit 1
+          fi
+
+          echo "Switch 2 fix source verification passed"
 
       - name: Configure Pico firmware
         working-directory: gp2040-ce
@@ -442,17 +495,17 @@ jobs:
           set -euo pipefail
 
           test -d "$GITHUB_WORKSPACE/pico-sdk"
-          test -f "$GITHUB_WORKSPACE/pico-sdk/pico_sdk_init.cmake"
 
           export PICO_SDK_PATH="$GITHUB_WORKSPACE/pico-sdk"
           export GP2040_BOARDCONFIG=Pico
+          export SKIP_WEBBUILD=TRUE
 
           cmake \
             -S . \
             -B build \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build Pico firmware
+      - name: Build Pico UF2
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -463,68 +516,73 @@ jobs:
             --config Release \
             --parallel 2
 
-      - name: Find generated UF2
-        id: find-uf2
+      - name: Find generated Pico UF2
         shell: bash
         run: |
           set -euo pipefail
 
           UF2_FILE="$(
             find gp2040-ce/build \
+              -maxdepth 2 \
               -type f \
-              -name "*.uf2" \
+              -name "GP2040-CE_*_Pico.uf2" \
               | head -n 1
           )"
 
           if [ -z "$UF2_FILE" ]; then
-            echo "No UF2 file was generated"
+              UF2_FILE="$(
+                find gp2040-ce/build \
+                  -maxdepth 3 \
+                  -type f \
+                  -name "*.uf2" \
+                  | head -n 1
+              )"
+          fi
+
+          if [ -z "$UF2_FILE" ]; then
+            echo "Pico UF2 file was not generated"
 
             find gp2040-ce/build \
+              -maxdepth 3 \
               -type f \
               | sort
 
             exit 1
           fi
 
+          echo "UF2_FILE=$UF2_FILE" \
+            >> "$GITHUB_ENV"
+
           echo "Generated UF2:"
           echo "$UF2_FILE"
 
-          echo "uf2_file=$UF2_FILE" \
-            >> "$GITHUB_OUTPUT"
-
-      - name: Package UF2
+      - name: Package UF2 and checksum
         shell: bash
         run: |
           set -euo pipefail
 
-          UF2_FILE="${{ steps.find-uf2.outputs.uf2_file }}"
-
-          if [ -z "$UF2_FILE" ]; then
-            echo "UF2 output path is empty"
-            exit 1
-          fi
-
+          test -n "${UF2_FILE:-}"
           test -f "$UF2_FILE"
 
           cp \
             "$UF2_FILE" \
-            GP2040-CE-Pico-Switch2-AutoA-Macro2-Macro6.uf2
+            GP2040-CE-v0.7.12-Switch2-Fix-AutoA.uf2
 
           sha256sum \
-            GP2040-CE-Pico-Switch2-AutoA-Macro2-Macro6.uf2 \
+            GP2040-CE-v0.7.12-Switch2-Fix-AutoA.uf2 \
             > SHA256SUMS.txt
 
-          echo "Packaged files:"
+          echo "Packaged firmware:"
           ls -lh \
-            GP2040-CE-Pico-Switch2-AutoA-Macro2-Macro6.uf2 \
+            GP2040-CE-v0.7.12-Switch2-Fix-AutoA.uf2 \
             SHA256SUMS.txt
 
-      - name: Upload UF2 artifact
+      - name: Upload Switch 2 firmware
         uses: actions/upload-artifact@v4
         with:
-          name: GP2040-CE-Pico-Switch2-AutoA-Macro2-Macro6
+          name: GP2040-CE-v0.7.12-Switch2-Fix-AutoA
           path: |
-            GP2040-CE-Pico-Switch2-AutoA-Macro2-Macro6.uf2
+            GP2040-CE-v0.7.12-Switch2-Fix-AutoA.uf2
             SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
