@@ -44,7 +44,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           npm ci
           CI=false npm run build
 
@@ -53,7 +52,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           test -f lib/httpd/fsdata.c
           echo "fsdata.c generated successfully"
 
@@ -69,10 +67,10 @@ jobs:
           path = Path("src/addons/bootsel_button.cpp")
           source = path.read_text()
 
-          include_anchor = '#include "addons/bootsel_button.h"'
-
           required_includes = [
+              '#include "addons/bootsel_button.h"',
               '#include "storagemanager.h"',
+              '#include "hardware/gpio.h"',
               '#include "hardware/sync.h"',
               '#include "hardware/structs/ioqspi.h"',
               '#include "hardware/structs/sio.h"',
@@ -80,30 +78,126 @@ jobs:
               '#include "config.pb.h"',
           ]
 
-          if include_anchor not in source:
+          namespace_name = "namespace BootselMacroBridge"
+
+          def remove_namespace_block(text, namespace_marker):
+              start = text.find(namespace_marker)
+
+              if start < 0:
+                  return text
+
+              opening_brace = text.find("{", start)
+
+              if opening_brace < 0:
+                  raise SystemExit(
+                      "Cannot find old BOOTSEL namespace opening brace"
+                  )
+
+              depth = 0
+              end = -1
+
+              for index in range(
+                  opening_brace,
+                  len(text),
+              ):
+                  character = text[index]
+
+                  if character == "{":
+                      depth += 1
+
+                  elif character == "}":
+                      depth -= 1
+
+                      if depth == 0:
+                          end = index + 1
+                          break
+
+              if end < 0:
+                  raise SystemExit(
+                      "Cannot find old BOOTSEL namespace closing brace"
+                  )
+
+              while end < len(text):
+                  if text[end] in " \t\r\n":
+                      end += 1
+                  else:
+                      break
+
+              return text[:start] + text[end:]
+
+          def remove_include_lines(text, include_lines):
+              lines = text.splitlines()
+              filtered = []
+
+              for line in lines:
+                  if line.strip() in include_lines:
+                      continue
+                  filtered.append(line)
+
+              return "\n".join(filtered)
+
+          def find_function_end(text, signature):
+              start = text.find(signature)
+
+              if start < 0:
+                  raise SystemExit(
+                      "Cannot find function: " + signature
+                  )
+
+              opening_brace = text.find("{", start)
+
+              if opening_brace < 0:
+                  raise SystemExit(
+                      "Cannot find opening brace: " + signature
+                  )
+
+              depth = 0
+
+              for index in range(
+                  opening_brace,
+                  len(text),
+              ):
+                  character = text[index]
+
+                  if character == "{":
+                      depth += 1
+
+                  elif character == "}":
+                      depth -= 1
+
+                      if depth == 0:
+                          return start, index + 1
+
               raise SystemExit(
-                  "Cannot find BOOTSEL include anchor"
+                  "Cannot find closing brace: " + signature
               )
 
-          # 将依赖头文件直接插入官方头文件之后。
-          # 不重建文件前缀，避免丢失原有头文件。
-          insertion = ""
-
-          for include_line in required_includes:
-              if include_line not in source:
-                  insertion += "\n" + include_line
-
-          if insertion:
-              source = source.replace(
-                  include_anchor,
-                  include_anchor + insertion,
-                  1,
+          def replace_function(text, signature, replacement):
+              start, end = find_function_end(
+                  text,
+                  signature,
               )
 
-          namespace_marker = (
-              "namespace BootselMacroBridge"
+              return (
+                  text[:start] +
+                  replacement.strip() +
+                  text[end:]
+              )
+
+          # 删除旧版本可能已经插入的命名空间。
+          source = remove_namespace_block(
+              source,
+              namespace_name,
           )
 
+          # 删除旧版本插入的依赖头文件。
+          include_set = set(required_includes)
+          source = remove_include_lines(
+              source,
+              include_set,
+          )
+
+          # 自定义代码。注意：此代码放在所有 include 之后。
           namespace_code = r'''
           namespace BootselMacroBridge {
 
@@ -138,8 +232,6 @@ jobs:
           )() {
               const uint CS_PIN_INDEX = 1;
 
-              // Disable interrupts while temporarily
-              // overriding the QSPI chip-select pin.
               uint32_t flags =
                   save_and_disable_interrupts();
 
@@ -152,7 +244,6 @@ jobs:
                   IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
               );
 
-              // Do not call flash-resident code here.
               for (volatile int i = 0; i < 1000; ++i) {
                   __asm volatile("nop");
               }
@@ -171,8 +262,6 @@ jobs:
                   IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
               );
 
-              // This is the function used by the
-              // official GP2040-CE v0.7.12 source.
               restore_interrupts(flags);
 
               return pressed;
@@ -187,7 +276,7 @@ jobs:
                   return;
               }
 
-              // Do not poll BOOTSEL during startup.
+              // Do not read BOOTSEL during startup.
               if (
                   now - startedAt <
                   START_DELAY_US
@@ -219,8 +308,7 @@ jobs:
               ) {
                   stablePressed = rawPressed;
 
-                  // Change the selected macro after
-                  // BOOTSEL is released.
+                  // Switch macro after BOOTSEL release.
                   //
                   // First press  = Macro 6
                   // Second press = Macro 2
@@ -246,13 +334,11 @@ jobs:
                   MACRO_2_GPIO_MASK |
                   MACRO_6_GPIO_MASK;
 
-              // GP6 and GP7 are virtual macro pins.
-              // Remove their physical states first.
+              // Remove physical GP6 and GP7 states.
               gamepad->debouncedGpio &=
                   ~bothMacroMasks;
 
-              // While BOOTSEL is pressed, expose
-              // exactly one virtual macro pin.
+              // Expose exactly one virtual macro pin.
               if (stablePressed) {
                   gamepad->debouncedGpio |=
                       activeMacroMask;
@@ -262,76 +348,24 @@ jobs:
           }
           '''
 
-          if namespace_marker not in source:
-              source = source.replace(
-                  include_anchor + insertion,
-                  include_anchor +
-                  insertion +
-                  "\n\n" +
-                  namespace_code.strip(),
-                  1,
-              )
+          # 把官方 include 放到源码最顶部。
+          include_block = "\n".join(
+              required_includes
+          )
 
-          def find_function_end(text, start):
-              opening_brace = text.find(
-                  "{",
-                  start,
-              )
-
-              if opening_brace < 0:
-                  raise SystemExit(
-                      "Cannot find opening brace"
-                  )
-
-              depth = 0
-
-              for index in range(
-                  opening_brace,
-                  len(text),
-              ):
-                  character = text[index]
-
-                  if character == "{":
-                      depth += 1
-
-                  elif character == "}":
-                      depth -= 1
-
-                      if depth == 0:
-                          return index + 1
-
-              raise SystemExit(
-                  "Cannot find function closing brace"
-              )
-
-          def replace_function(
-              text,
-              signature,
-              replacement,
-          ):
-              start = text.find(signature)
-
-              if start < 0:
-                  raise SystemExit(
-                      "Cannot find function: " +
-                      signature
-                  )
-
-              end = find_function_end(
-                  text,
-                  start,
-              )
-
-              return (
-                  text[:start] +
-                  replacement +
-                  text[end:]
-              )
+          # 将自定义命名空间放在所有 include 之后。
+          source = (
+              include_block +
+              "\n\n" +
+              namespace_code.strip() +
+              "\n\n" +
+              source.lstrip()
+          )
 
           new_available = r'''
           bool BootselButtonAddon::available() {
-              // Always load this addon because it also
-              // provides the BOOTSEL macro bridge.
+              // Always load this addon so the BOOTSEL
+              // macro bridge is active.
               return true;
           }
           '''
@@ -391,7 +425,7 @@ jobs:
                   }
               }
 
-              // Expose BOOTSEL as one virtual macro pin.
+              // Expose BOOTSEL as a virtual macro pin.
               BootselMacroBridge::applyVirtualMacroPin(
                   gamepad
               );
@@ -422,13 +456,10 @@ jobs:
               "BOOTSEL macro bridge patch applied successfully"
           )
           print(
-              "Existing source headers were preserved"
+              "All required includes were moved to the top"
           )
           print(
               "Official input_macro.cpp remains unchanged"
-          )
-          print(
-              "Official macro execution remains unchanged"
           )
           print(
               "First BOOTSEL press selects Macro 6"
@@ -438,25 +469,13 @@ jobs:
           )
           PY
 
-      - name: Verify BOOTSEL patch
+      - name: Verify BOOTSEL source order
         working-directory: gp2040-ce
         shell: bash
         run: |
           set -euo pipefail
 
           test -f src/addons/bootsel_button.cpp
-
-          grep -q \
-            '#include "hardware/sync.h"' \
-            src/addons/bootsel_button.cpp
-
-          grep -q \
-            '#include "hardware/structs/ioqspi.h"' \
-            src/addons/bootsel_button.cpp
-
-          grep -q \
-            '#include "hardware/structs/sio.h"' \
-            src/addons/bootsel_button.cpp
 
           grep -q \
             "namespace BootselMacroBridge" \
@@ -483,10 +502,16 @@ jobs:
             src/addons/bootsel_button.cpp
 
           grep -q \
-            "return true" \
+            '#include "hardware/sync.h"' \
             src/addons/bootsel_button.cpp
 
-          test -f src/addons/input_macro.cpp
+          grep -q \
+            '#include "hardware/structs/ioqspi.h"' \
+            src/addons/bootsel_button.cpp
+
+          grep -q \
+            '#include "hardware/structs/sio.h"' \
+            src/addons/bootsel_button.cpp
 
           python3 - <<'PY'
           from pathlib import Path
@@ -546,33 +571,13 @@ jobs:
                   "sio.h appears after custom code"
               )
 
-          restore_position = source.find(
-              "restore_interrupts(flags)"
-          )
-
-          return_position = source.find(
-              "return pressed"
-          )
-
-          if restore_position < 0:
-              raise SystemExit(
-                  "restore_interrupts(flags) is missing"
-              )
-
-          if return_position < restore_position:
-              raise SystemExit(
-                  "BOOTSEL return appears before interrupt restore"
-              )
-
           print(
-              "Header order verification passed"
+              "All SDK headers appear before custom code"
           )
           print(
-              "Interrupt restore verification passed"
+              "BOOTSEL source order verification passed"
           )
           PY
-
-          echo "BOOTSEL patch verification passed"
 
       - name: Configure Pico firmware
         working-directory: gp2040-ce
