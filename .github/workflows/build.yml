@@ -1,4 +1,4 @@
-name: Build GP2040-CE Switch 2 Four A Stable Macro Toggle
+name: Build GP2040-CE Switch 2 Four A Reliable GP6 GP7
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
       - name: Checkout build repository
         uses: actions/checkout@v4
 
-      - name: Checkout official GP2040-CE source
+      - name: Checkout GP2040-CE source
         uses: actions/checkout@v4
         with:
           repository: OpenStickCommunity/GP2040-CE
@@ -68,7 +68,7 @@ jobs:
 
           echo "fsdata.c verified"
 
-      - name: Apply four A and stable BOOTSEL toggle patch
+      - name: Apply reliable four A GP6 GP7 patch
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -107,7 +107,7 @@ jobs:
               text,
               function_name,
           ):
-              signature_pattern = re.compile(
+              pattern = re.compile(
                   r"^[ \t]*"
                   r"(?:bool|void|int|uint|uint32_t|"
                   r"uint64_t|std::string)"
@@ -119,7 +119,7 @@ jobs:
               )
 
               matches = list(
-                  signature_pattern.finditer(text)
+                  pattern.finditer(text)
               )
 
               if len(matches) != 1:
@@ -208,9 +208,9 @@ jobs:
               )
 
           missing_includes = [
-              include_line
-              for include_line in required_includes
-              if include_line not in source
+              item
+              for item in required_includes
+              if item not in source
           ]
 
           if missing_includes:
@@ -229,8 +229,6 @@ jobs:
               "InputMacro::available",
               r'''
           bool InputMacro::available() {
-              // Keep this addon active for the automatic
-              // A sequence and BOOTSEL macro switching.
               return true;
           }
           ''',
@@ -254,6 +252,9 @@ jobs:
 
           constexpr uint GP6_PIN = 6;
           constexpr uint GP7_PIN = 7;
+
+          constexpr int GP6_FALLBACK_MACRO_INDEX = 1;
+          constexpr int GP7_FALLBACK_MACRO_INDEX = 5;
 
           constexpr uint64_t USB_SETTLE_DELAY_US =
               2000000;
@@ -288,13 +289,11 @@ jobs:
 
           uint64_t selectionEndsAt = 0;
 
-          // false means GP6, true means GP7.
           bool useGp7Macro = false;
 
-          // Remains set until a valid macro is started.
+          // This remains set until a valid macro is started.
           bool macroStartRequest = false;
 
-          // BOOTSEL edge detector state.
           bool bootselRawPressed = false;
           bool bootselStablePressed = false;
           uint64_t bootselChangedAt = 0;
@@ -390,14 +389,12 @@ jobs:
           }
 
           void updateBootselEdges() {
-              SequenceStage currentStage = stage;
-
               if (
-                  currentStage !=
+                  stage !=
                       SequenceStage::MACRO_SELECTION &&
-                  currentStage !=
+                  stage !=
                       SequenceStage::START_MACRO &&
-                  currentStage !=
+                  stage !=
                       SequenceStage::MACRO_RUNNING
               ) {
                   return;
@@ -434,15 +431,14 @@ jobs:
                   return;
               }
 
-              bool previousStableState =
+              bool oldStableState =
                   bootselStablePressed;
 
               bootselStablePressed =
                   rawPressed;
 
-              // Only a stable rising edge creates a switch.
               if (
-                  previousStableState ||
+                  oldStableState ||
                   !bootselStablePressed
               ) {
                   return;
@@ -452,8 +448,6 @@ jobs:
                   stage ==
                   SequenceStage::MACRO_SELECTION
               ) {
-                  // During the ten-second window, one press
-                  // selects GP7 instead of the GP6 default.
                   useGp7Macro = true;
                   return;
               }
@@ -464,12 +458,10 @@ jobs:
                   stage ==
                       SequenceStage::MACRO_RUNNING
               ) {
-                  // After the macro starts, each new press
-                  // toggles between GP6 and GP7.
                   useGp7Macro = !useGp7Macro;
 
-                  // Force a clean stop and restart using
-                  // the newly selected GPIO mapping.
+                  // Stop the old macro and keep a persistent
+                  // request to start the newly selected one.
                   macroStartRequest = true;
                   stage =
                       SequenceStage::START_MACRO;
@@ -496,9 +488,7 @@ jobs:
                   autoAPressStartedAt = now;
               }
 
-              if (
-                  !autoAIsPressed
-              ) {
+              if (!autoAIsPressed) {
                   return;
               }
 
@@ -533,7 +523,6 @@ jobs:
                   return;
               }
 
-              // Use start-to-start spacing of 500 ms.
               nextAutoAPressAt =
                   autoAPressStartedAt +
                   AUTO_A_INTERVAL_US;
@@ -572,9 +561,7 @@ jobs:
                       SequenceStage::AUTO_A &&
                   autoAIsPressed
               ) {
-                  // GP2040-CE SwitchProDriver:
-                  // B1 -> Switch B
-                  // B2 -> Switch A
+                  // SwitchProDriver maps B2 to Nintendo A.
                   gamepad->state.buttons |=
                       GAMEPAD_MASK_B2;
               }
@@ -596,8 +583,10 @@ jobs:
                   : GP6_PIN;
           }
 
-          bool isGp7Selected() {
-              return useGp7Macro;
+          int getFallbackMacroIndex() {
+              return useGp7Macro
+                  ? GP7_FALLBACK_MACRO_INDEX
+                  : GP6_FALLBACK_MACRO_INDEX;
           }
 
           }
@@ -621,8 +610,6 @@ jobs:
                   return;
               }
 
-              // A BOOTSEL switch while a macro is already
-              // running must stop the old macro first.
               if (isMacroRunning) {
                   reset();
               }
@@ -637,7 +624,7 @@ jobs:
 
               int selectedMacro = -1;
 
-              // Find the macro assigned to GP6 or GP7.
+              // First resolve the configured GPIO mapping.
               for (
                   int index = 0;
                   index < MAX_MACRO_LIMIT;
@@ -654,9 +641,19 @@ jobs:
                   }
               }
 
-              // Keep the request alive if the selected
-              // GPIO has no valid macro mapping.
+              // If the mapping is temporarily unavailable,
+              // use the expected Macro 2 or Macro 6 index.
               if (selectedMacro < 0) {
+                  selectedMacro =
+                      Switch2FixSupport::
+                          getFallbackMacroIndex();
+              }
+
+              if (
+                  selectedMacro < 0 ||
+                  selectedMacro >=
+                      MAX_MACRO_LIMIT
+              ) {
                   return;
               }
 
@@ -668,6 +665,8 @@ jobs:
                   !candidate.enabled ||
                   candidate.macroInputs_count == 0
               ) {
+                  // Do not consume the request. The next
+                  // frame will retry the same macro.
                   return;
               }
 
@@ -711,8 +710,7 @@ jobs:
               isMacroTriggerHeld = true;
               prevMacroInputPressed = true;
 
-              // Force continuous looping for the selected
-              // GP6 or GP7 macro.
+              // Force the selected macro to loop.
               macro.macroType =
                   ON_HOLD_REPEAT;
 
@@ -731,8 +729,8 @@ jobs:
               isMacroRunning = true;
               macroStartTime = getMicro();
 
-              // Clear the pending request only after the
-              // selected macro is successfully started.
+              // Clear the request only after successful
+              // validation and activation.
               Switch2FixSupport::
                   markMacroStarted();
           }
@@ -830,13 +828,10 @@ jobs:
           )
 
           print(
-              "Four-A stable BOOTSEL patch applied"
+              "Reliable four-A GP6/GP7 patch applied"
           )
           print(
               "Automatic A count: 4"
-          )
-          print(
-              "Automatic A interval: 500 ms"
           )
           print(
               "Automatic A mapping: GAMEPAD_MASK_B2"
@@ -845,22 +840,19 @@ jobs:
               "Default macro: GP6"
           )
           print(
-              "BOOTSEL selection: GP7 during first window"
+              "BOOTSEL macro: GP7"
           )
           print(
-              "BOOTSEL toggles GP6 and GP7 afterward"
+              "Macro request retries until valid start"
           )
           print(
-              "BOOTSEL edge detector has no permanent lock"
+              "GP6 fallback index: Macro 2"
           )
           print(
-              "Macro start requests retry until success"
+              "GP7 fallback index: Macro 6"
           )
           print(
               "Selected macro loops continuously"
-          )
-          print(
-              "Official runCurrentMacro() preserved"
           )
           PY
 
@@ -927,11 +919,23 @@ jobs:
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "updateBootselEdges" \
+            "GP6_FALLBACK_MACRO_INDEX = 1" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "GP7_FALLBACK_MACRO_INDEX = 5" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
             "macroStartRequest" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "getFallbackMacroIndex" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "markMacroStarted" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
@@ -986,10 +990,10 @@ jobs:
             exit 1
           fi
 
-          echo "Stable four-A patch verification passed"
+          echo "Reliable patch verification passed"
 
           echo
-          echo "Patched functions:"
+          echo "InputMacro functions:"
           grep \
             -n \
             -E \
@@ -997,7 +1001,7 @@ jobs:
             "$INPUT_MACRO_FILE"
 
           echo
-          echo "Automatic A configuration:"
+          echo "Automatic A settings:"
           grep \
             -n \
             -E \
@@ -1005,11 +1009,11 @@ jobs:
             "$INPUT_MACRO_FILE"
 
           echo
-          echo "BOOTSEL edge detector:"
+          echo "Reliable macro fallback:"
           grep \
             -n \
-            -A 90 \
-            "void updateBootselEdges" \
+            -A 35 \
+            "getFallbackMacroIndex" \
             "$INPUT_MACRO_FILE"
 
       - name: Configure Pico firmware
@@ -1089,7 +1093,7 @@ jobs:
           test -n "${UF2_FILE:-}"
           test -f "$UF2_FILE"
 
-          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-FourA-StableToggle.uf2"
+          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-FourA-ReliableGP6GP7.uf2"
 
           cp \
             "$UF2_FILE" \
@@ -1112,9 +1116,9 @@ jobs:
       - name: Upload UF2 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GP2040-CE-v0.7.12-Switch2-FourA-StableToggle
+          name: GP2040-CE-v0.7.12-Switch2-FourA-ReliableGP6GP7
           path: |
-            GP2040-CE-v0.7.12-Switch2-FourA-StableToggle.uf2
+            GP2040-CE-v0.7.12-Switch2-FourA-ReliableGP6GP7.uf2
             SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
