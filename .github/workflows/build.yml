@@ -1,4 +1,4 @@
-name: Build GP2040-CE v0.7.12 Switch 2 Stable BOOTSEL
+name: Build GP2040-CE Switch 2 Five A Macro Selector
 
 on:
   workflow_dispatch:
@@ -70,7 +70,7 @@ jobs:
           echo "Generated web filesystem:"
           ls -lh lib/httpd/fsdata.c
 
-      - name: Apply stable BOOTSEL and Switch A patch
+      - name: Apply five A and macro selector patch
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -78,7 +78,6 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
           macro_file = Path(
               "src/addons/input_macro.cpp"
@@ -112,60 +111,56 @@ jobs:
 
           if "namespace Switch2FixSupport" in source:
               raise SystemExit(
-                  "Switch2FixSupport was already inserted"
+                  "Switch2FixSupport already exists"
               )
 
           def find_function_span(
               text,
-              return_type,
-              qualified_name,
+              signatures,
+              function_name,
           ):
-              signature_pattern = re.compile(
-                  (
-                      r"^[ \t]*"
-                      + re.escape(return_type)
-                      + r"[ \t]+"
-                      + re.escape(qualified_name)
-                      + r"[ \t]*\([ \t\r\n]*\)"
-                  ),
-                  re.MULTILINE,
-              )
+              positions = []
 
-              matches = list(
-                  signature_pattern.finditer(text)
-              )
+              for signature in signatures:
+                  position = text.find(signature)
 
-              if len(matches) != 1:
+                  if position >= 0:
+                      positions.append(
+                          (position, signature)
+                      )
+
+              if len(positions) != 1:
                   raise SystemExit(
                       "Expected exactly one "
-                      + qualified_name
-                      + " function, found "
-                      + str(len(matches))
+                      + function_name
+                      + " signature, found "
+                      + str(len(positions))
                   )
 
-              match = matches[0]
+              start, signature = positions[0]
 
               opening_brace = text.find(
                   "{",
-                  match.end(),
+                  start + len(signature),
               )
 
               if opening_brace < 0:
                   raise SystemExit(
                       "Opening brace for "
-                      + qualified_name
+                      + function_name
                       + " was not found"
                   )
 
-              between_signature_and_brace = text[
-                  match.end():opening_brace
+              between = text[
+                  start + len(signature):
+                  opening_brace
               ]
 
-              if between_signature_and_brace.strip():
+              if between.strip():
                   raise SystemExit(
-                      "Unexpected text between "
-                      + qualified_name
-                      + " signature and opening brace"
+                      "Unexpected text before opening "
+                      "brace of "
+                      + function_name
                   )
 
               depth = 0
@@ -179,6 +174,7 @@ jobs:
 
                   if character == "{":
                       depth += 1
+
                   elif character == "}":
                       depth -= 1
 
@@ -189,25 +185,22 @@ jobs:
               if closing_brace < 0:
                   raise SystemExit(
                       "Closing brace for "
-                      + qualified_name
+                      + function_name
                       + " was not found"
                   )
 
-              return (
-                  match.start(),
-                  closing_brace + 1,
-              )
+              return start, closing_brace + 1
 
           def replace_function(
               text,
-              return_type,
-              qualified_name,
+              signatures,
+              function_name,
               replacement,
           ):
               start, end = find_function_span(
                   text,
-                  return_type,
-                  qualified_name,
+                  signatures,
+                  function_name,
               )
 
               return (
@@ -239,83 +232,104 @@ jobs:
           ]
 
           if missing_includes:
-              include_block = (
-                  gpio_include
-                  + "\n"
-                  + "\n".join(missing_includes)
-              )
-
               source = source.replace(
                   gpio_include,
-                  include_block,
+                  (
+                      gpio_include
+                      + "\n"
+                      + "\n".join(missing_includes)
+                  ),
                   1,
               )
 
           new_available = r'''
           bool InputMacro::available() {
-              // The automatic Switch A sequence and BOOTSEL
-              // macro trigger require this addon to stay loaded.
+              // Keep InputMacro active for the automatic
+              // A sequence and BOOTSEL selection window.
               return true;
           }
           '''
 
           source = replace_function(
               source,
-              "bool",
-              "InputMacro::available",
+              [
+                  "bool InputMacro::available()",
+                  "bool InputMacro::available ()",
+              ],
+              "InputMacro::available()",
               new_available,
           )
 
           setup_start, setup_end = find_function_span(
               source,
-              "void",
-              "InputMacro::setup",
+              [
+                  "void InputMacro::setup()",
+                  "void InputMacro::setup ()",
+              ],
+              "InputMacro::setup()",
           )
 
           helper_code = r'''
           namespace Switch2FixSupport {
 
-          constexpr int MACRO_2_INDEX = 1;
-          constexpr int MACRO_6_INDEX = 5;
+          enum class SequenceStage {
+              WAITING_FOR_USB,
+              AUTO_A,
+              MACRO_SELECTION,
+              START_MACRO,
+              MACRO_RUNNING
+          };
 
-          // Wait until USB is mounted before generating
-          // any automatic controller input.
-          constexpr uint64_t AUTO_A_AFTER_MOUNT_US =
-              4000000;
+          constexpr uint GP6_PIN = 6;
+          constexpr uint GP7_PIN = 7;
 
-          // Reading BOOTSEL temporarily manipulates the QSPI
-          // flash chip-select line. Delay polling until after
-          // the Switch 2 connection has become stable.
-          constexpr uint64_t BOOTSEL_AFTER_MOUNT_US =
-              5000000;
+          // Give the Switch 2 USB connection time to settle
+          // before injecting the first controller input.
+          constexpr uint64_t USB_SETTLE_DELAY_US =
+              2000000;
 
-          constexpr uint64_t BOOTSEL_POLL_INTERVAL_US =
-              10000;
+          constexpr int AUTO_A_PRESS_COUNT = 5;
 
-          constexpr uint64_t BOOTSEL_RELEASE_DEBOUNCE_US =
-              30000;
-
+          // Start-to-start interval between A presses.
           constexpr uint64_t AUTO_A_INTERVAL_US =
               500000;
 
           constexpr uint64_t AUTO_A_HOLD_US =
               120000;
 
-          constexpr int AUTO_A_PRESS_COUNT = 3;
+          // Start the macro ten seconds after the fifth
+          // automatic A button has been released.
+          constexpr uint64_t MACRO_SELECTION_WINDOW_US =
+              10000000;
+
+          // BOOTSEL is sampled only during the selection
+          // window and stops being sampled afterward.
+          constexpr uint64_t BOOTSEL_POLL_INTERVAL_US =
+              5000;
+
+          constexpr uint64_t BOOTSEL_RELEASE_DEBOUNCE_US =
+              30000;
+
+          SequenceStage stage =
+              SequenceStage::WAITING_FOR_USB;
 
           bool usbWasMounted = false;
           uint64_t usbMountedAt = 0;
 
+          int autoAPressCount = 0;
+          bool autoAIsPressed = false;
+          uint64_t autoAPressStartedAt = 0;
+          uint64_t nextAutoAPressAt = 0;
+
+          uint64_t selectionStartedAt = 0;
+          uint64_t selectionEndsAt = 0;
+
+          bool useGp7Macro = false;
+          bool macroStartRequest = false;
+
           uint64_t bootselLastPollAt = 0;
           uint64_t bootselReleaseStartedAt = 0;
-
           bool bootselPressLocked = false;
-          bool bootselPressEvent = false;
-
-          int selectedMacroIndex =
-              MACRO_6_INDEX;
-
-          int autoAPressCount = 0;
 
           bool __no_inline_not_in_flash_func(
               readBootselButton
@@ -356,18 +370,26 @@ jobs:
               return pressed;
           }
 
-          void resetConnectionSession() {
+          void resetSession() {
+              stage =
+                  SequenceStage::WAITING_FOR_USB;
+
               usbMountedAt = 0;
+
+              autoAPressCount = 0;
+              autoAIsPressed = false;
+              autoAPressStartedAt = 0;
+              nextAutoAPressAt = 0;
+
+              selectionStartedAt = 0;
+              selectionEndsAt = 0;
+
+              useGp7Macro = false;
+              macroStartRequest = false;
 
               bootselLastPollAt = 0;
               bootselReleaseStartedAt = 0;
               bootselPressLocked = false;
-              bootselPressEvent = false;
-
-              selectedMacroIndex =
-                  MACRO_6_INDEX;
-
-              autoAPressCount = 0;
           }
 
           void updateUsbConnection() {
@@ -376,7 +398,7 @@ jobs:
 
               if (!mounted) {
                   if (usbWasMounted) {
-                      resetConnectionSession();
+                      resetSession();
                   }
 
                   usbWasMounted = false;
@@ -384,41 +406,36 @@ jobs:
               }
 
               if (!usbWasMounted) {
-                  resetConnectionSession();
+                  resetSession();
 
                   usbWasMounted = true;
                   usbMountedAt = now;
+
+                  nextAutoAPressAt =
+                      now + USB_SETTLE_DELAY_US;
+
+                  stage =
+                      SequenceStage::AUTO_A;
               }
           }
 
-          bool hasMountedFor(
-              uint64_t duration
-          ) {
+          void updateBootselSelection() {
               if (
-                  !usbWasMounted ||
-                  usbMountedAt == 0
-              ) {
-                  return false;
-              }
-
-              return (
-                  getMicro() - usbMountedAt >=
-                  duration
-              );
-          }
-
-          void updateBootselButton(
-              bool macroIsRunning
-          ) {
-              if (
-                  !hasMountedFor(
-                      BOOTSEL_AFTER_MOUNT_US
-                  )
+                  stage !=
+                  SequenceStage::MACRO_SELECTION
               ) {
                   return;
               }
 
               uint64_t now = getMicro();
+
+              if (now >= selectionEndsAt) {
+                  stage =
+                      SequenceStage::START_MACRO;
+
+                  macroStartRequest = true;
+                  return;
+              }
 
               if (
                   now - bootselLastPollAt <
@@ -435,15 +452,13 @@ jobs:
               if (pressed) {
                   bootselReleaseStartedAt = 0;
 
-                  // Lock the event immediately when any
-                  // pressed sample is observed. This makes
-                  // short presses much easier to capture.
                   if (!bootselPressLocked) {
                       bootselPressLocked = true;
 
-                      if (!macroIsRunning) {
-                          bootselPressEvent = true;
-                      }
+                      // One BOOTSEL press during the
+                      // ten-second window permanently
+                      // selects the GP7 macro.
+                      useGp7Macro = true;
                   }
 
                   return;
@@ -469,73 +484,114 @@ jobs:
               }
           }
 
-          bool hasBootselPressEvent() {
-              return bootselPressEvent;
+          void updateSequence() {
+              updateUsbConnection();
+
+              if (!usbWasMounted) {
+                  return;
+              }
+
+              uint64_t now = getMicro();
+
+              if (
+                  stage ==
+                  SequenceStage::AUTO_A
+              ) {
+                  if (
+                      !autoAIsPressed &&
+                      autoAPressCount <
+                          AUTO_A_PRESS_COUNT &&
+                      now >= nextAutoAPressAt
+                  ) {
+                      autoAIsPressed = true;
+                      autoAPressStartedAt = now;
+                  }
+
+                  if (
+                      autoAIsPressed &&
+                      now - autoAPressStartedAt >=
+                          AUTO_A_HOLD_US
+                  ) {
+                      autoAIsPressed = false;
+                      ++autoAPressCount;
+
+                      if (
+                          autoAPressCount >=
+                          AUTO_A_PRESS_COUNT
+                      ) {
+                          selectionStartedAt = now;
+
+                          selectionEndsAt =
+                              now +
+                              MACRO_SELECTION_WINDOW_US;
+
+                          useGp7Macro = false;
+                          bootselLastPollAt = 0;
+                          bootselReleaseStartedAt = 0;
+                          bootselPressLocked = false;
+
+                          stage =
+                              SequenceStage::
+                                  MACRO_SELECTION;
+                      } else {
+                          // Preserve a 500 ms start-to-start
+                          // interval rather than adding the
+                          // hold duration to the interval.
+                          nextAutoAPressAt =
+                              autoAPressStartedAt +
+                              AUTO_A_INTERVAL_US;
+                      }
+                  }
+              }
+
+              updateBootselSelection();
           }
 
-          void discardBootselPressEvent() {
-              bootselPressEvent = false;
-          }
-
-          int getSelectedMacroIndex() {
-              return selectedMacroIndex;
-          }
-
-          void selectNextMacro() {
-              selectedMacroIndex =
-                  selectedMacroIndex ==
-                      MACRO_6_INDEX
-                      ? MACRO_2_INDEX
-                      : MACRO_6_INDEX;
-          }
-
-          void runAutomaticASequence(
+          void applyAutomaticA(
               Gamepad* gamepad
           ) {
               if (
-                  !hasMountedFor(
-                      AUTO_A_AFTER_MOUNT_US
-                  )
+                  stage ==
+                      SequenceStage::AUTO_A &&
+                  autoAIsPressed
               ) {
-                  return;
-              }
-
-              if (
-                  autoAPressCount >=
-                  AUTO_A_PRESS_COUNT
-              ) {
-                  return;
-              }
-
-              uint64_t elapsed =
-                  getMicro() -
-                  (
-                      usbMountedAt +
-                      AUTO_A_AFTER_MOUNT_US
-                  );
-
-              uint64_t pressStart =
-                  static_cast<uint64_t>(
-                      autoAPressCount
-                  ) *
-                  AUTO_A_INTERVAL_US;
-
-              uint64_t pressEnd =
-                  pressStart +
-                  AUTO_A_HOLD_US;
-
-              if (
-                  elapsed >= pressStart &&
-                  elapsed < pressEnd
-              ) {
-                  // GP2040-CE SwitchProDriver mapping:
-                  // pressedB2() becomes Nintendo Switch A.
+                  // GP2040-CE SwitchProDriver maps B2
+                  // to Nintendo Switch A.
                   gamepad->state.buttons |=
                       GAMEPAD_MASK_B2;
               }
+          }
 
-              if (elapsed >= pressEnd) {
-                  ++autoAPressCount;
+          bool consumeMacroStartRequest() {
+              if (!macroStartRequest) {
+                  return false;
+              }
+
+              macroStartRequest = false;
+              return true;
+          }
+
+          uint getSelectedGpio() {
+              return useGp7Macro
+                  ? GP7_PIN
+                  : GP6_PIN;
+          }
+
+          bool isSelectingGp7() {
+              return useGp7Macro;
+          }
+
+          void markMacroRunning() {
+              stage =
+                  SequenceStage::MACRO_RUNNING;
+          }
+
+          void retryMacroStart() {
+              if (
+                  stage ==
+                  SequenceStage::START_MACRO
+              ) {
+                  macroStartRequest = true;
               }
           }
 
@@ -551,92 +607,94 @@ jobs:
 
           new_check_press = r'''
           void InputMacro::checkMacroPress() {
-              Switch2FixSupport::updateBootselButton(
-                  isMacroRunning
-              );
-
               pressedMacro = -1;
 
               if (
                   !Switch2FixSupport::
-                      hasBootselPressEvent()
+                      consumeMacroStartRequest()
               ) {
                   return;
               }
 
               if (isMacroRunning) {
-                  Switch2FixSupport::
-                      discardBootselPressEvent();
-
                   return;
               }
 
-              const int candidateMacro =
+              const uint selectedGpio =
                   Switch2FixSupport::
-                      getSelectedMacroIndex();
+                      getSelectedGpio();
 
-              if (
-                  candidateMacro < 0 ||
-                  candidateMacro >=
-                      MAX_MACRO_LIMIT
+              const uint32_t selectedPinMask =
+                  static_cast<uint32_t>(1u)
+                  << selectedGpio;
+
+              int selectedMacro = -1;
+
+              // Resolve the macro dynamically from the
+              // GP6 or GP7 pin mapping. This does not assume
+              // fixed Macro 2 or Macro 6 array indexes.
+              for (
+                  int index = 0;
+                  index < MAX_MACRO_LIMIT;
+                  ++index
               ) {
-                  Switch2FixSupport::
-                      discardBootselPressEvent();
+                  if (
+                      macroPinMasks[index] &
+                      selectedPinMask
+                  ) {
+                      selectedMacro = index;
+                      break;
+                  }
+              }
 
+              if (selectedMacro < 0) {
                   return;
               }
 
-              Macro& candidate =
+              Macro& macro =
                   inputMacroOptions
-                      ->macroList[candidateMacro];
+                      ->macroList[selectedMacro];
 
               if (
-                  !candidate.enabled ||
-                  candidate.macroInputs_count == 0
+                  !macro.enabled ||
+                  macro.macroInputs_count == 0
               ) {
-                  Switch2FixSupport::
-                      discardBootselPressEvent();
-
                   return;
               }
 
-              pressedMacro = candidateMacro;
+              pressedMacro = selectedMacro;
           }
           '''
 
           source = replace_function(
               source,
-              "void",
-              "InputMacro::checkMacroPress",
+              [
+                  "void InputMacro::checkMacroPress()",
+                  "void InputMacro::checkMacroPress ()",
+              ],
+              "InputMacro::checkMacroPress()",
               new_check_press,
           )
 
           new_check_action = r'''
           void InputMacro::checkMacroAction() {
               if (
-                  !Switch2FixSupport::
-                      hasBootselPressEvent()
-              ) {
-                  return;
-              }
-
-              Switch2FixSupport::
-                  discardBootselPressEvent();
-
-              if (
-                  isMacroRunning ||
                   pressedMacro < 0 ||
                   pressedMacro >=
                       MAX_MACRO_LIMIT
               ) {
-                  pressedMacro = -1;
+                  return;
+              }
+
+              if (isMacroRunning) {
                   return;
               }
 
               macroPosition = pressedMacro;
               macroInputPosition = 0;
+
               isMacroTriggerHeld = true;
-              prevMacroInputPressed = false;
+              prevMacroInputPressed = true;
 
               Macro& macro =
                   inputMacroOptions
@@ -650,9 +708,10 @@ jobs:
                   return;
               }
 
-              // A BOOTSEL press always runs one complete
-              // macro sequence.
-              macro.macroType = ON_PRESS;
+              // The selected GP6 or GP7 macro continuously
+              // repeats after the ten-second window.
+              macro.macroType =
+                  ON_HOLD_REPEAT;
 
               MacroInput& macroInput =
                   macro.macroInputs[0];
@@ -669,17 +728,18 @@ jobs:
               isMacroRunning = true;
               macroStartTime = getMicro();
 
-              // Change to the other macro only after the
-              // current macro was successfully started.
               Switch2FixSupport::
-                  selectNextMacro();
+                  markMacroRunning();
           }
           '''
 
           source = replace_function(
               source,
-              "void",
-              "InputMacro::checkMacroAction",
+              [
+                  "void InputMacro::checkMacroAction()",
+                  "void InputMacro::checkMacroAction ()",
+              ],
+              "InputMacro::checkMacroAction()",
               new_check_action,
           )
 
@@ -687,7 +747,7 @@ jobs:
           void InputMacro::preprocess()
           {
               Switch2FixSupport::
-                  updateUsbConnection();
+                  updateSequence();
 
               FocusModeOptions* focusModeOptions =
                   &Storage::getInstance()
@@ -725,21 +785,30 @@ jobs:
 
               checkMacroPress();
               checkMacroAction();
+
+              // Keep using the official GP2040-CE macro
+              // playback implementation.
               runCurrentMacro();
 
               Gamepad* gamepad =
                   Storage::getInstance()
                       .GetGamepad();
 
+              // Apply automatic Switch A after normal macro
+              // processing. The macro has not started yet
+              // while the five-A sequence is running.
               Switch2FixSupport::
-                  runAutomaticASequence(gamepad);
+                  applyAutomaticA(gamepad);
           }
           '''
 
           source = replace_function(
               source,
-              "void",
-              "InputMacro::preprocess",
+              [
+                  "void InputMacro::preprocess()",
+                  "void InputMacro::preprocess ()",
+              ],
+              "InputMacro::preprocess()",
               new_preprocess,
           )
 
@@ -770,31 +839,34 @@ jobs:
           )
 
           print(
-              "Stable Switch 2 patch applied"
+              "Five-A macro selector patch applied"
           )
           print(
-              "Both preprocess brace styles are supported"
+              "Automatic button: Switch A / B2"
           )
           print(
-              "Switch A mapping: GAMEPAD_MASK_B2"
+              "Automatic A count: 5"
           )
           print(
-              "Automatic A starts 4 seconds after USB mount"
+              "Automatic A interval: 500 ms"
           )
           print(
-              "BOOTSEL starts 5 seconds after USB mount"
+              "Macro selection window: 10 seconds"
           )
           print(
-              "BOOTSEL polling interval: 10 ms"
+              "Default selection: GP6 mapped macro"
           )
           print(
-              "First BOOTSEL press: Macro 6"
+              "BOOTSEL selection: GP7 mapped macro"
           )
           print(
-              "Second BOOTSEL press: Macro 2"
+              "Selected macro mode: continuous repeat"
           )
           print(
-              "Official runCurrentMacro() was preserved"
+              "BOOTSEL polling stops after selection"
+          )
+          print(
+              "Official runCurrentMacro() preserved"
           )
           PY
 
@@ -861,31 +933,19 @@ jobs:
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "readBootselButton" \
+            "AUTO_A_PRESS_COUNT = 5" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "save_and_disable_interrupts" \
+            "AUTO_A_INTERVAL_US" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "restore_interrupts(flags)" \
+            "AUTO_A_HOLD_US" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "AUTO_A_AFTER_MOUNT_US" \
-            "$INPUT_MACRO_FILE"
-
-          grep -q \
-            "BOOTSEL_AFTER_MOUNT_US" \
-            "$INPUT_MACRO_FILE"
-
-          grep -q \
-            "BOOTSEL_POLL_INTERVAL_US" \
-            "$INPUT_MACRO_FILE"
-
-          grep -q \
-            "BOOTSEL_RELEASE_DEBOUNCE_US" \
+            "MACRO_SELECTION_WINDOW_US" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
@@ -893,15 +953,35 @@ jobs:
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "MACRO_2_INDEX = 1" \
+            "constexpr uint GP6_PIN = 6" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "MACRO_6_INDEX = 5" \
+            "constexpr uint GP7_PIN = 7" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "macro.macroType = ON_PRESS" \
+            "getSelectedGpio" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "macroPinMasks\[index\]" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "readBootselButton" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "restore_interrupts(flags)" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "macro.macroType" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "ON_HOLD_REPEAT" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
@@ -915,7 +995,7 @@ jobs:
           if grep -q \
             "GAMEPAD_MASK_B1" \
             "$INPUT_MACRO_FILE"; then
-            echo "Wrong Switch B mapping was found"
+            echo "Wrong Switch B mapping found"
             exit 1
           fi
 
@@ -929,14 +1009,7 @@ jobs:
           if grep -q \
             "allPins |= macroPinMasks" \
             "$INPUT_MACRO_FILE"; then
-            echo "Old virtual GPIO trigger logic found"
-            exit 1
-          fi
-
-          if grep -q \
-            "InputMacro::preprocess() was not found" \
-            "$INPUT_MACRO_FILE"; then
-            echo "Old Python error text found in source"
+            echo "Old virtual GPIO trigger found"
             exit 1
           fi
 
@@ -951,20 +1024,19 @@ jobs:
             "$INPUT_MACRO_FILE"
 
           echo
-          echo "Verified Switch A mapping:"
+          echo "Five-A settings:"
           grep \
             -n \
-            -A 5 \
-            -B 5 \
-            "GAMEPAD_MASK_B2" \
+            -E \
+            "AUTO_A_PRESS_COUNT|AUTO_A_INTERVAL_US|AUTO_A_HOLD_US|GAMEPAD_MASK_B2" \
             "$INPUT_MACRO_FILE"
 
           echo
-          echo "Verified preprocess function:"
+          echo "Macro selector settings:"
           grep \
             -n \
-            -A 70 \
-            "void InputMacro::preprocess" \
+            -E \
+            "GP6_PIN|GP7_PIN|MACRO_SELECTION_WINDOW_US|ON_HOLD_REPEAT" \
             "$INPUT_MACRO_FILE"
 
       - name: Configure Pico firmware
@@ -1036,7 +1108,7 @@ jobs:
           echo "Selected UF2:"
           echo "$UF2_FILE"
 
-      - name: Package stable firmware
+      - name: Package firmware
         shell: bash
         run: |
           set -euo pipefail
@@ -1044,7 +1116,7 @@ jobs:
           test -n "${UF2_FILE:-}"
           test -f "$UF2_FILE"
 
-          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-Stable-BOOTSEL-AutoA.uf2"
+          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-FiveA-MacroSelector.uf2"
 
           cp \
             "$UF2_FILE" \
@@ -1067,9 +1139,9 @@ jobs:
       - name: Upload UF2 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GP2040-CE-v0.7.12-Switch2-Stable-BOOTSEL-AutoA
+          name: GP2040-CE-v0.7.12-Switch2-FiveA-MacroSelector
           path: |
-            GP2040-CE-v0.7.12-Switch2-Stable-BOOTSEL-AutoA.uf2
+            GP2040-CE-v0.7.12-Switch2-FiveA-MacroSelector.uf2
             SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
