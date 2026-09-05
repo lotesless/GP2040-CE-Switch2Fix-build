@@ -115,33 +115,57 @@ jobs:
                   "Switch2FixSupport was already inserted"
               )
 
-          def replace_function(
+          def find_function_span(
               text,
-              signature_pattern,
-              replacement,
-              function_name,
+              return_type,
+              qualified_name,
           ):
-              match = re.search(
-                  signature_pattern,
-                  text,
+              signature_pattern = re.compile(
+                  (
+                      r"^[ \t]*"
+                      + re.escape(return_type)
+                      + r"[ \t]+"
+                      + re.escape(qualified_name)
+                      + r"[ \t]*\([ \t\r\n]*\)"
+                  ),
                   re.MULTILINE,
               )
 
-              if match is None:
+              matches = list(
+                  signature_pattern.finditer(text)
+              )
+
+              if len(matches) != 1:
                   raise SystemExit(
-                      f"{function_name} was not found"
+                      "Expected exactly one "
+                      + qualified_name
+                      + " function, found "
+                      + str(len(matches))
                   )
+
+              match = matches[0]
 
               opening_brace = text.find(
                   "{",
-                  match.start(),
-                  match.end() + 2,
+                  match.end(),
               )
 
               if opening_brace < 0:
                   raise SystemExit(
-                      f"Opening brace for "
-                      f"{function_name} was not found"
+                      "Opening brace for "
+                      + qualified_name
+                      + " was not found"
+                  )
+
+              between_signature_and_brace = text[
+                  match.end():opening_brace
+              ]
+
+              if between_signature_and_brace.strip():
+                  raise SystemExit(
+                      "Unexpected text between "
+                      + qualified_name
+                      + " signature and opening brace"
                   )
 
               depth = 0
@@ -164,14 +188,32 @@ jobs:
 
               if closing_brace < 0:
                   raise SystemExit(
-                      f"Closing brace for "
-                      f"{function_name} was not found"
+                      "Closing brace for "
+                      + qualified_name
+                      + " was not found"
                   )
 
               return (
-                  text[:match.start()]
-                  + replacement.rstrip()
-                  + text[closing_brace + 1:]
+                  match.start(),
+                  closing_brace + 1,
+              )
+
+          def replace_function(
+              text,
+              return_type,
+              qualified_name,
+              replacement,
+          ):
+              start, end = find_function_span(
+                  text,
+                  return_type,
+                  qualified_name,
+              )
+
+              return (
+                  text[:start]
+                  + replacement.strip()
+                  + text[end:]
               )
 
           gpio_include = (
@@ -211,38 +253,24 @@ jobs:
 
           new_available = r'''
           bool InputMacro::available() {
-              // BOOTSEL and the connection-time A sequence
-              // require InputMacro to remain loaded.
+              // The automatic Switch A sequence and BOOTSEL
+              // macro trigger require this addon to stay loaded.
               return true;
           }
           '''
 
           source = replace_function(
               source,
-              (
-                  r"^[ \t]*bool[ \t]+"
-                  r"InputMacro::available[ \t]*"
-                  r"\([ \t]*\)[ \t]*\{"
-              ),
-              new_available.strip(),
-              "InputMacro::available()",
+              "bool",
+              "InputMacro::available",
+              new_available,
           )
 
-          setup_pattern = re.compile(
-              (
-                  r"^[ \t]*void[ \t]+"
-                  r"InputMacro::setup[ \t]*"
-                  r"\([ \t]*\)[ \t]*\{"
-              ),
-              re.MULTILINE,
+          setup_start, setup_end = find_function_span(
+              source,
+              "void",
+              "InputMacro::setup",
           )
-
-          setup_match = setup_pattern.search(source)
-
-          if setup_match is None:
-              raise SystemExit(
-                  "InputMacro::setup() was not found"
-              )
 
           helper_code = r'''
           namespace Switch2FixSupport {
@@ -250,14 +278,14 @@ jobs:
           constexpr int MACRO_2_INDEX = 1;
           constexpr int MACRO_6_INDEX = 5;
 
-          // Wait for the Switch 2 USB connection to become
-          // stable before injecting any controller input.
+          // Wait until USB is mounted before generating
+          // any automatic controller input.
           constexpr uint64_t AUTO_A_AFTER_MOUNT_US =
               4000000;
 
-          // BOOTSEL touches the QSPI flash CS line.
-          // Start it later than the automatic A sequence so
-          // it cannot interfere with USB enumeration.
+          // Reading BOOTSEL temporarily manipulates the QSPI
+          // flash chip-select line. Delay polling until after
+          // the Switch 2 connection has become stable.
           constexpr uint64_t BOOTSEL_AFTER_MOUNT_US =
               5000000;
 
@@ -363,10 +391,6 @@ jobs:
               }
           }
 
-          bool isUsbMounted() {
-              return usbWasMounted;
-          }
-
           bool hasMountedFor(
               uint64_t duration
           ) {
@@ -411,9 +435,9 @@ jobs:
               if (pressed) {
                   bootselReleaseStartedAt = 0;
 
-                  // Generate the event immediately after one
-                  // detected sample. The lock prevents a held
-                  // BOOTSEL button from repeating.
+                  // Lock the event immediately when any
+                  // pressed sample is observed. This makes
+                  // short presses much easier to capture.
                   if (!bootselPressLocked) {
                       bootselPressLocked = true;
 
@@ -504,8 +528,8 @@ jobs:
                   elapsed >= pressStart &&
                   elapsed < pressEnd
               ) {
-                  // GP2040-CE SwitchProDriver maps B2
-                  // to the Nintendo Switch A button.
+                  // GP2040-CE SwitchProDriver mapping:
+                  // pressedB2() becomes Nintendo Switch A.
                   gamepad->state.buttons |=
                       GAMEPAD_MASK_B2;
               }
@@ -519,10 +543,10 @@ jobs:
           '''
 
           source = (
-              source[:setup_match.start()]
+              source[:setup_start]
               + helper_code.strip()
               + "\n\n"
-              + source[setup_match.start():]
+              + source[setup_start:]
           )
 
           new_check_press = r'''
@@ -582,13 +606,9 @@ jobs:
 
           source = replace_function(
               source,
-              (
-                  r"^[ \t]*void[ \t]+"
-                  r"InputMacro::checkMacroPress[ \t]*"
-                  r"\([ \t]*\)[ \t]*\{"
-              ),
-              new_check_press.strip(),
-              "InputMacro::checkMacroPress()",
+              "void",
+              "InputMacro::checkMacroPress",
+              new_check_press,
           )
 
           new_check_action = r'''
@@ -630,8 +650,8 @@ jobs:
                   return;
               }
 
-              // Every BOOTSEL press must execute exactly
-              // one complete macro sequence.
+              // A BOOTSEL press always runs one complete
+              // macro sequence.
               macro.macroType = ON_PRESS;
 
               MacroInput& macroInput =
@@ -649,8 +669,8 @@ jobs:
               isMacroRunning = true;
               macroStartTime = getMicro();
 
-              // Alternate only after the macro was
-              // successfully started.
+              // Change to the other macro only after the
+              // current macro was successfully started.
               Switch2FixSupport::
                   selectNextMacro();
           }
@@ -658,13 +678,9 @@ jobs:
 
           source = replace_function(
               source,
-              (
-                  r"^[ \t]*void[ \t]+"
-                  r"InputMacro::checkMacroAction[ \t]*"
-                  r"\([ \t]*\)[ \t]*\{"
-              ),
-              new_check_action.strip(),
-              "InputMacro::checkMacroAction()",
+              "void",
+              "InputMacro::checkMacroAction",
+              new_check_action,
           )
 
           new_preprocess = r'''
@@ -715,8 +731,6 @@ jobs:
                   Storage::getInstance()
                       .GetGamepad();
 
-              // Apply automatic A after macro processing so
-              // another addon cannot turn this pulse into B.
               Switch2FixSupport::
                   runAutomaticASequence(gamepad);
           }
@@ -724,13 +738,9 @@ jobs:
 
           source = replace_function(
               source,
-              (
-                  r"^[ \t]*void[ \t]+"
-                  r"InputMacro::preprocess[ \t]*"
-                  r"\([ \t]*\)[ \t]*\{"
-              ),
-              new_preprocess.strip(),
-              "InputMacro::preprocess()",
+              "void",
+              "InputMacro::preprocess",
+              new_preprocess,
           )
 
           macro_file.write_text(
@@ -763,19 +773,19 @@ jobs:
               "Stable Switch 2 patch applied"
           )
           print(
+              "Both preprocess brace styles are supported"
+          )
+          print(
               "Switch A mapping: GAMEPAD_MASK_B2"
           )
           print(
               "Automatic A starts 4 seconds after USB mount"
           )
           print(
-              "BOOTSEL polling starts 5 seconds after USB mount"
+              "BOOTSEL starts 5 seconds after USB mount"
           )
           print(
-              "BOOTSEL press is captured immediately"
-          )
-          print(
-              "BOOTSEL release debounce: 30 ms"
+              "BOOTSEL polling interval: 10 ms"
           )
           print(
               "First BOOTSEL press: Macro 6"
@@ -784,7 +794,7 @@ jobs:
               "Second BOOTSEL press: Macro 2"
           )
           print(
-              "Official runCurrentMacro() was not modified"
+              "Official runCurrentMacro() was preserved"
           )
           PY
 
@@ -809,6 +819,12 @@ jobs:
           test "$(
             grep -c \
               "bool InputMacro::available" \
+              "$INPUT_MACRO_FILE"
+          )" -eq 1
+
+          test "$(
+            grep -c \
+              "void InputMacro::setup" \
               "$INPUT_MACRO_FILE"
           )" -eq 1
 
@@ -918,37 +934,37 @@ jobs:
           fi
 
           if grep -q \
-            "InputMacro trigger block not found" \
+            "InputMacro::preprocess() was not found" \
             "$INPUT_MACRO_FILE"; then
-            echo "Old failed patch text found"
+            echo "Old Python error text found in source"
             exit 1
           fi
 
           echo "Patched source verification passed"
 
           echo
-          echo "Verified Switch button mapping:"
+          echo "InputMacro function locations:"
           grep \
             -n \
-            -A 4 \
-            -B 4 \
+            -E \
+            "InputMacro::(available|setup|checkMacroPress|checkMacroAction|runCurrentMacro|preprocess)" \
+            "$INPUT_MACRO_FILE"
+
+          echo
+          echo "Verified Switch A mapping:"
+          grep \
+            -n \
+            -A 5 \
+            -B 5 \
             "GAMEPAD_MASK_B2" \
             "$INPUT_MACRO_FILE"
 
           echo
-          echo "Verified USB mount gating:"
+          echo "Verified preprocess function:"
           grep \
             -n \
-            -A 35 \
-            "void updateUsbConnection" \
-            "$INPUT_MACRO_FILE"
-
-          echo
-          echo "Verified BOOTSEL capture:"
-          grep \
-            -n \
-            -A 75 \
-            "void updateBootselButton" \
+            -A 70 \
+            "void InputMacro::preprocess" \
             "$INPUT_MACRO_FILE"
 
       - name: Configure Pico firmware
