@@ -556,6 +556,9 @@ jobs:
                   // checkMacroPress(). The new start request
                   // remains active until successful startup.
                   requestMacroStart();
+
+                  // Keep the first default Macro 2 request alive
+                  // across the selection-window transition.
               }
           }
 
@@ -646,6 +649,9 @@ jobs:
                       selectionEndsAt
                   ) {
                       requestMacroStart();
+
+                  // Keep the first default Macro 2 request alive
+                  // across the selection-window transition.
                   }
               }
           }
