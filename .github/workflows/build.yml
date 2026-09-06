@@ -1,4 +1,4 @@
-name: Build GP2040-CE Switch 2 Four A Reliable GP6 GP7 Delayed Start
+name: Build GP2040-CE Switch 2 Four A Non Interruptible
 
 on:
   workflow_dispatch:
@@ -714,6 +714,12 @@ jobs:
               macro.macroType =
                   ON_HOLD_REPEAT;
 
+              // The official runner cancels an interruptible
+              // macro when any stale input exists in its first
+              // frame. Disable only that cancellation; retain
+              // the configured non-exclusive output behavior.
+              macro.interruptible = false;
+
               MacroInput& macroInput =
                   macro.macroInputs[0];
 
@@ -1093,7 +1099,7 @@ jobs:
           test -n "${UF2_FILE:-}"
           test -f "$UF2_FILE"
 
-          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-FourA-ReliableGP6GP7-DelayedStart.uf2"
+          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-FourA-NonInterruptible.uf2"
 
           cp \
             "$UF2_FILE" \
@@ -1116,9 +1122,9 @@ jobs:
       - name: Upload UF2 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GP2040-CE-v0.7.12-Switch2-FourA-ReliableGP6GP7-DelayedStart
+          name: GP2040-CE-v0.7.12-Switch2-FourA-NonInterruptible
           path: |
-            GP2040-CE-v0.7.12-Switch2-FourA-ReliableGP6GP7-DelayedStart.uf2
+            GP2040-CE-v0.7.12-Switch2-FourA-NonInterruptible.uf2
             SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
