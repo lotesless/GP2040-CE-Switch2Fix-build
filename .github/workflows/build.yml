@@ -267,8 +267,10 @@ jobs:
           constexpr uint64_t AUTO_A_HOLD_US =
               120000;
 
+          // Leave a wider quiet period after the fourth A
+          // report before starting the default macro.
           constexpr uint64_t MACRO_SELECTION_WINDOW_US =
-              10000000;
+              10500000;
 
           constexpr uint64_t BOOTSEL_POLL_INTERVAL_US =
               5000;
