@@ -1,4 +1,4 @@
-name: Build GP2040-CE Switch 2 Stable Four A Macro
+name: Build GP2040-CE Switch 2 Four A Watchdog Macro
 
 on:
   workflow_dispatch:
@@ -48,7 +48,6 @@ jobs:
           test -f "$GITHUB_WORKSPACE/pico-sdk/pico_sdk_init.cmake"
 
           echo "Pico SDK verified"
-          echo "PICO_SDK_PATH=$GITHUB_WORKSPACE/pico-sdk"
 
       - name: Build web assets
         working-directory: gp2040-ce/www
@@ -59,7 +58,7 @@ jobs:
           npm ci
           CI=false npm run build
 
-      - name: Verify generated web filesystem
+      - name: Verify web filesystem
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -67,10 +66,9 @@ jobs:
 
           test -f lib/httpd/fsdata.c
 
-          echo "Web filesystem verified:"
-          ls -lh lib/httpd/fsdata.c
+          echo "fsdata.c verified"
 
-      - name: Apply stable macro patch
+      - name: Apply four A watchdog macro patch
         working-directory: gp2040-ce
         shell: bash
         run: |
@@ -80,25 +78,15 @@ jobs:
           from pathlib import Path
           import re
 
-          MACRO_FILE = Path(
+          macro_file = Path(
               "src/addons/input_macro.cpp"
           )
 
-          BOOTSEL_FILE = Path(
+          bootsel_file = Path(
               "src/addons/bootsel_button.cpp"
           )
 
-          if not MACRO_FILE.is_file():
-              raise SystemExit(
-                  "Missing src/addons/input_macro.cpp"
-              )
-
-          if not BOOTSEL_FILE.is_file():
-              raise SystemExit(
-                  "Missing src/addons/bootsel_button.cpp"
-              )
-
-          source = MACRO_FILE.read_text(
+          source = macro_file.read_text(
               encoding="utf-8"
           )
 
@@ -119,77 +107,27 @@ jobs:
               text,
               function_name,
           ):
-              """
-              Locate a C++ member function by qualified name.
-
-              This intentionally does not depend on:
-              - exact return type formatting;
-              - indentation;
-              - brace being on the same line;
-              - brace being on the next line.
-              """
-
-              escaped_name = re.escape(
-                  function_name
-              )
-
-              signature_pattern = re.compile(
-                  r"(?m)"
+              pattern = re.compile(
                   r"^[ \t]*"
-                  r"(?:[\w:<>*&]+[ \t]+)+"
-                  + escaped_name
+                  r"(?:bool|void|int|uint|uint32_t|"
+                  r"uint64_t|std::string)"
+                  r"[ \t]+"
+                  + re.escape(function_name)
                   + r"[ \t]*"
-                  r"\([ \t\r\n]*\)"
+                  r"\([ \t\r\n]*\)",
+                  re.MULTILINE,
               )
 
               matches = list(
-                  signature_pattern.finditer(text)
+                  pattern.finditer(text)
               )
 
               if len(matches) != 1:
-                  # Fallback matcher. This is intentionally
-                  # broader for source-format compatibility.
-                  fallback_pattern = re.compile(
-                      r"(?m)"
-                      r"^[ \t]*.*?"
-                      + escaped_name
-                      + r"[ \t]*"
-                      r"\([ \t\r\n]*\)"
-                  )
-
-                  fallback_matches = list(
-                      fallback_pattern.finditer(text)
-                  )
-
-                  if len(fallback_matches) == 1:
-                      matches = fallback_matches
-
-              if len(matches) != 1:
-                  contexts = []
-
-                  for match in matches:
-                      start = max(
-                          0,
-                          match.start() - 100,
-                      )
-
-                      end = min(
-                          len(text),
-                          match.end() + 150,
-                      )
-
-                      contexts.append(
-                          text[start:end]
-                          .replace("\n", "\\n")
-                      )
-
                   raise SystemExit(
                       "Expected exactly one "
                       + function_name
                       + ", found "
                       + str(len(matches))
-                      + ". Context="
-                      + repr(contexts)
                   )
 
               match = matches[0]
@@ -201,18 +139,19 @@ jobs:
 
               if opening_brace < 0:
                   raise SystemExit(
-                      "Opening brace not found for "
+                      "Opening brace for "
                       + function_name
+                      + " was not found"
                   )
 
               depth = 0
               closing_brace = -1
 
-              for index in range(
+              for position in range(
                   opening_brace,
                   len(text),
               ):
-                  character = text[index]
+                  character = text[position]
 
                   if character == "{":
                       depth += 1
@@ -221,13 +160,14 @@ jobs:
                       depth -= 1
 
                       if depth == 0:
-                          closing_brace = index
+                          closing_brace = position
                           break
 
               if closing_brace < 0:
                   raise SystemExit(
-                      "Closing brace not found for "
+                      "Closing brace for "
                       + function_name
+                      + " was not found"
                   )
 
               return (
@@ -246,11 +186,9 @@ jobs:
               )
 
               return (
-                  text[:start].rstrip()
-                  + "\n\n"
+                  text[:start]
                   + replacement.strip()
-                  + "\n\n"
-                  + text[end:].lstrip()
+                  + text[end:]
               )
 
           gpio_include = (
@@ -266,13 +204,13 @@ jobs:
 
           if gpio_include not in source:
               raise SystemExit(
-                  "hardware/gpio.h include was not found"
+                  "hardware/gpio.h was not found"
               )
 
           missing_includes = [
-              include_line
-              for include_line in required_includes
-              if include_line not in source
+              item
+              for item in required_includes
+              if item not in source
           ]
 
           if missing_includes:
@@ -291,8 +229,7 @@ jobs:
               "InputMacro::available",
               r'''
           bool InputMacro::available() {
-              // Keep InputMacro active for the automatic
-              // A sequence and macro switching.
+              // Keep InputMacro permanently available.
               return true;
           }
           ''',
@@ -314,9 +251,9 @@ jobs:
               MACRO_RUNNING
           };
 
-          // Fixed configuration:
-          // GP6 -> Macro 2 -> zero-based index 1.
-          // GP7 -> Macro 6 -> zero-based index 5.
+          // The user configuration is fixed:
+          // GP6 -> Macro 2, array index 1.
+          // GP7 -> Macro 6, array index 5.
           constexpr int GP6_MACRO_INDEX = 1;
           constexpr int GP7_MACRO_INDEX = 5;
 
@@ -328,7 +265,6 @@ jobs:
 
           constexpr int AUTO_A_PRESS_COUNT = 4;
 
-          // Start-to-start interval.
           constexpr uint64_t AUTO_A_INTERVAL_US =
               500000;
 
@@ -344,6 +280,15 @@ jobs:
           constexpr uint64_t BOOTSEL_DEBOUNCE_US =
               30000;
 
+          // Retry macro startup every 20 ms.
+          constexpr uint64_t MACRO_RETRY_INTERVAL_US =
+              20000;
+
+          // If startup is still not confirmed after this
+          // time, reset the playback state and retry.
+          constexpr uint64_t MACRO_START_WATCHDOG_US =
+              2000000;
+
           SequenceStage stage =
               SequenceStage::WAITING_FOR_USB;
 
@@ -357,15 +302,14 @@ jobs:
 
           uint64_t selectionEndsAt = 0;
 
-          // false = GP6 / Macro 2.
-          // true = GP7 / Macro 6.
+          // false selects GP6 / Macro 2.
+          // true selects GP7 / Macro 6.
           bool useGp7Macro = false;
 
-          // Never clear this until the selected macro is
-          // successfully initialized.
           bool macroStartRequest = false;
+          uint64_t macroRequestStartedAt = 0;
+          uint64_t macroLastRetryAt = 0;
 
-          // BOOTSEL edge detector.
           bool bootselRawPressed = false;
           bool bootselStablePressed = false;
           uint64_t bootselChangedAt = 0;
@@ -424,7 +368,10 @@ jobs:
               selectionEndsAt = 0;
 
               useGp7Macro = false;
+
               macroStartRequest = false;
+              macroRequestStartedAt = 0;
+              macroLastRetryAt = 0;
 
               bootselRawPressed = false;
               bootselStablePressed = false;
@@ -433,8 +380,13 @@ jobs:
           }
 
           void requestMacroStart() {
-              // This function is idempotent. Repeated calls
-              // do not create duplicate macro requests.
+              uint64_t now = getMicro();
+
+              if (!macroStartRequest) {
+                  macroRequestStartedAt = now;
+                  macroLastRetryAt = 0;
+              }
+
               macroStartRequest = true;
               stage =
                   SequenceStage::START_MACRO;
@@ -498,22 +450,15 @@ jobs:
                   rawPressed !=
                   bootselRawPressed
               ) {
-                  bootselRawPressed =
-                      rawPressed;
-
+                  bootselRawPressed = rawPressed;
                   bootselChangedAt = now;
               }
 
               if (
                   rawPressed ==
-                  bootselStablePressed
-              ) {
-                  return;
-              }
-
-              if (
+                      bootselStablePressed ||
                   now - bootselChangedAt <
-                  BOOTSEL_DEBOUNCE_US
+                      BOOTSEL_DEBOUNCE_US
               ) {
                   return;
               }
@@ -524,7 +469,6 @@ jobs:
               bootselStablePressed =
                   rawPressed;
 
-              // Only released -> pressed is an action.
               if (
                   oldStableState ||
                   !bootselStablePressed
@@ -536,8 +480,9 @@ jobs:
                   stage ==
                   SequenceStage::MACRO_SELECTION
               ) {
-                  // During the first selection window,
-                  // BOOTSEL changes default GP6 to GP7.
+                  // One BOOTSEL press in the ten-second
+                  // window changes the default GP6 choice
+                  // to GP7.
                   useGp7Macro = true;
                   return;
               }
@@ -548,17 +493,13 @@ jobs:
                   stage ==
                       SequenceStage::MACRO_RUNNING
               ) {
-                  // Every later BOOTSEL press toggles
-                  // GP6 Macro 2 and GP7 Macro 6.
+                  // Toggle GP6 Macro 2 <-> GP7 Macro 6.
                   useGp7Macro = !useGp7Macro;
 
-                  // The old macro will be reset by
-                  // checkMacroPress(). The new start request
-                  // remains active until successful startup.
+                  // The old macro is stopped in
+                  // checkMacroPress(). The request remains
+                  // pending until the new one starts.
                   requestMacroStart();
-
-                  // Keep the first default Macro 2 request alive
-                  // across the selection-window transition.
               }
           }
 
@@ -600,17 +541,12 @@ jobs:
                   autoAPressCount >=
                   AUTO_A_PRESS_COUNT
               ) {
-                  // The ten-second timer begins after
-                  // the fourth A is released.
                   selectionEndsAt =
                       now +
                       MACRO_SELECTION_WINDOW_US;
 
-                  // Default selection is always GP6.
                   useGp7Macro = false;
 
-                  // Begin with a clean BOOTSEL released
-                  // state for this connection session.
                   bootselRawPressed = false;
                   bootselStablePressed = false;
                   bootselChangedAt = now;
@@ -623,8 +559,6 @@ jobs:
                   return;
               }
 
-              // Keep the next press start exactly 500 ms
-              // after the previous press start.
               nextAutoAPressAt =
                   autoAPressStartedAt +
                   AUTO_A_INTERVAL_US;
@@ -649,9 +583,24 @@ jobs:
                       selectionEndsAt
                   ) {
                       requestMacroStart();
+                  }
+              }
 
-                  // Keep the first default Macro 2 request alive
-                  // across the selection-window transition.
+              if (
+                  stage ==
+                  SequenceStage::START_MACRO &&
+                  macroStartRequest
+              ) {
+                  uint64_t now = getMicro();
+
+                  if (
+                      now - macroRequestStartedAt >=
+                      MACRO_START_WATCHDOG_US
+                  ) {
+                      // Force a fresh attempt without
+                      // losing the selected macro.
+                      macroRequestStartedAt = now;
+                      macroLastRetryAt = 0;
                   }
               }
           }
@@ -664,9 +613,9 @@ jobs:
                       SequenceStage::AUTO_A &&
                   autoAIsPressed
               ) {
-                  // GP2040-CE SwitchProDriver mapping:
-                  // B1 -> Nintendo Switch B.
-                  // B2 -> Nintendo Switch A.
+                  // SwitchProDriver:
+                  // B1 -> Switch B.
+                  // B2 -> Switch A.
                   gamepad->state.buttons |=
                       GAMEPAD_MASK_B2;
               }
@@ -676,10 +625,24 @@ jobs:
               return macroStartRequest;
           }
 
+          bool shouldRetryMacroStart() {
+              uint64_t now = getMicro();
+
+              if (
+                  now - macroLastRetryAt <
+                  MACRO_RETRY_INTERVAL_US
+              ) {
+                  return false;
+              }
+
+              macroLastRetryAt = now;
+              return true;
+          }
+
           void markMacroStarted() {
-              // This is the only function that clears the
-              // pending macro request.
               macroStartRequest = false;
+              macroRequestStartedAt = 0;
+              macroLastRetryAt = 0;
 
               stage =
                   SequenceStage::MACRO_RUNNING;
@@ -712,8 +675,15 @@ jobs:
                   return;
               }
 
-              // Always clear the old playback state before
-              // attempting to launch a newly selected macro.
+              if (
+                  !Switch2FixSupport::
+                      shouldRetryMacroStart()
+              ) {
+                  return;
+              }
+
+              // Always discard the old playback state before
+              // starting a new selected macro.
               if (isMacroRunning) {
                   reset();
               }
@@ -727,8 +697,6 @@ jobs:
                   selectedMacro >=
                       MAX_MACRO_LIMIT
               ) {
-                  // The request remains active and will be
-                  // tried again on the next frame.
                   return;
               }
 
@@ -740,13 +708,11 @@ jobs:
                   !candidate.enabled ||
                   candidate.macroInputs_count == 0
               ) {
-                  // Do not consume the request if the
-                  // selected macro is not ready.
+                  // Keep the request alive. The next retry
+                  // will inspect the same macro again.
                   return;
               }
 
-              // checkMacroAction() runs immediately after
-              // this function in the same preprocess frame.
               pressedMacro = selectedMacro;
           }
           '''
@@ -784,17 +750,12 @@ jobs:
 
               macroPosition = pressedMacro;
               macroInputPosition = 0;
-
               isMacroTriggerHeld = true;
               prevMacroInputPressed = true;
 
-              // Force continuous playback.
+              // Force continuous looping.
               macro.macroType =
                   ON_HOLD_REPEAT;
-              // Prevent the stale automatic-A report from
-              // interrupting the software-started macro.
-              macro.interruptible = false;
-              macro.exclusive = true;
 
               MacroInput& macroInput =
                   macro.macroInputs[0];
@@ -808,11 +769,10 @@ jobs:
                       ? INPUT_HOLD_US
                       : macroInputDuration;
 
-              // Initialize the playback state completely
-              // before clearing the request.
               isMacroRunning = true;
               macroStartTime = getMicro();
 
+              // Only now is the start considered successful.
               Switch2FixSupport::
                   markMacroStarted();
           }
@@ -864,19 +824,14 @@ jobs:
                   }
               }
 
-              // A pending request is checked every frame
-              // until the selected macro starts successfully.
               checkMacroPress();
               checkMacroAction();
-
-              // Keep the official macro playback function.
               runCurrentMacro();
 
               Gamepad* gamepad =
                   Storage::getInstance()
                       .GetGamepad();
 
-              // Automatic A is applied after macro processing.
               Switch2FixSupport::
                   applyAutomaticA(gamepad);
           }
@@ -888,7 +843,7 @@ jobs:
               new_preprocess,
           )
 
-          MACRO_FILE.write_text(
+          macro_file.write_text(
               source,
               encoding="utf-8",
               newline="\n",
@@ -908,44 +863,35 @@ jobs:
           }
           '''
 
-          BOOTSEL_FILE.write_text(
+          bootsel_file.write_text(
               disabled_bootsel_source,
               encoding="utf-8",
               newline="\n",
           )
 
           print(
-              "Stable macro patch applied successfully"
+              "Four-A watchdog patch applied"
           )
           print(
               "Automatic A count: 4"
           )
           print(
-              "Automatic A interval: 500 ms"
-          )
-          print(
               "Automatic A mapping: GAMEPAD_MASK_B2"
           )
           print(
-              "Default macro: GP6 / Macro 2"
+              "GP6 always selects Macro 2"
           )
           print(
-              "BOOTSEL macro: GP7 / Macro 6"
+              "GP7 always selects Macro 6"
           )
           print(
-              "Macro start request persists until success"
+              "Macro startup retries every 20 ms"
           )
           print(
-              "Macro startup is attempted every frame"
+              "Macro startup watchdog: 2 seconds"
           )
           print(
-              "Old macro state is reset before switching"
-          )
-          print(
-              "Selected macro uses ON_HOLD_REPEAT"
-          )
-          print(
-              "Official runCurrentMacro() preserved"
+              "Selected macro loops continuously"
           )
           PY
 
@@ -961,63 +907,38 @@ jobs:
           test -f "$INPUT_MACRO_FILE"
           test -f "$BOOTSEL_FILE"
 
-          echo "Detected InputMacro functions:"
-          grep \
-            -n \
-            -E \
-            "InputMacro::(available|setup|checkMacroPress|checkMacroAction|runCurrentMacro|preprocess)[[:space:]]*\\(" \
-            "$INPUT_MACRO_FILE"
-
           test "$(
-            grep -Ec \
-              "^[[:space:]]*bool[[:space:]]+InputMacro::available[[:space:]]*\\(" \
+            grep -c \
+              "namespace Switch2FixSupport" \
               "$INPUT_MACRO_FILE"
           )" -eq 1
 
           test "$(
-            grep -Ec \
-              "^[[:space:]]*void[[:space:]]+InputMacro::setup[[:space:]]*\\(" \
+            grep -c \
+              "void InputMacro::checkMacroPress" \
               "$INPUT_MACRO_FILE"
           )" -eq 1
 
           test "$(
-            grep -Ec \
-              "^[[:space:]]*void[[:space:]]+InputMacro::checkMacroPress[[:space:]]*\\(" \
+            grep -c \
+              "void InputMacro::checkMacroAction" \
               "$INPUT_MACRO_FILE"
           )" -eq 1
 
           test "$(
-            grep -Ec \
-              "^[[:space:]]*void[[:space:]]+InputMacro::checkMacroAction[[:space:]]*\\(" \
+            grep -c \
+              "void InputMacro::runCurrentMacro" \
               "$INPUT_MACRO_FILE"
           )" -eq 1
 
           test "$(
-            grep -Ec \
-              "^[[:space:]]*void[[:space:]]+InputMacro::runCurrentMacro[[:space:]]*\\(" \
+            grep -c \
+              "void InputMacro::preprocess" \
               "$INPUT_MACRO_FILE"
           )" -eq 1
-
-          test "$(
-            grep -Ec \
-              "^[[:space:]]*void[[:space:]]+InputMacro::preprocess[[:space:]]*\\(" \
-              "$INPUT_MACRO_FILE"
-          )" -eq 1
-
-          grep -q \
-            "namespace Switch2FixSupport" \
-            "$INPUT_MACRO_FILE"
 
           grep -q \
             "AUTO_A_PRESS_COUNT = 4" \
-            "$INPUT_MACRO_FILE"
-
-          grep -q \
-            "AUTO_A_INTERVAL_US" \
-            "$INPUT_MACRO_FILE"
-
-          grep -q \
-            "AUTO_A_HOLD_US" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
@@ -1033,23 +954,19 @@ jobs:
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "MACRO_SELECTION_WINDOW_US" \
+            "MACRO_RETRY_INTERVAL_US" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "macroStartRequest" \
+            "MACRO_START_WATCHDOG_US" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "isMacroStartRequested" \
+            "shouldRetryMacroStart" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
             "markMacroStarted" \
-            "$INPUT_MACRO_FILE"
-
-          grep -q \
-            "updateBootselEdges" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
@@ -1079,35 +996,14 @@ jobs:
           if grep -q \
             "GAMEPAD_MASK_B1" \
             "$INPUT_MACRO_FILE"; then
-            echo "Incorrect Switch B mapping found"
+            echo "Wrong Switch B mapping found"
             exit 1
           fi
 
           if grep -q \
             "macroPinMasks\[index\]" \
             "$INPUT_MACRO_FILE"; then
-            echo "Old dynamic macro scan found"
-            exit 1
-          fi
-
-          if grep -q \
-            "shouldRetryMacroStart" \
-            "$INPUT_MACRO_FILE"; then
-            echo "Old throttled retry function found"
-            exit 1
-          fi
-
-          if grep -q \
-            "MACRO_RETRY_INTERVAL_US" \
-            "$INPUT_MACRO_FILE"; then
-            echo "Old retry interval found"
-            exit 1
-          fi
-
-          if grep -q \
-            "MACRO_START_WATCHDOG_US" \
-            "$INPUT_MACRO_FILE"; then
-            echo "Old startup watchdog found"
+            echo "Dynamic macro scan was not removed"
             exit 1
           fi
 
@@ -1125,32 +1021,38 @@ jobs:
             exit 1
           fi
 
-          echo
-          echo "Stable source verification passed"
+          if grep -q \
+            "InputMacro::preprocess() was not found" \
+            "$INPUT_MACRO_FILE"; then
+            echo "Old patch error text found"
+            exit 1
+          fi
+
+          echo "Four-A watchdog source verification passed"
 
           echo
-          echo "Automatic A configuration:"
+          echo "InputMacro functions:"
           grep \
             -n \
             -E \
-            "AUTO_A_PRESS_COUNT|AUTO_A_INTERVAL_US|AUTO_A_HOLD_US|GAMEPAD_MASK_B2" \
+            "InputMacro::(available|setup|checkMacroPress|checkMacroAction|runCurrentMacro|preprocess)" \
             "$INPUT_MACRO_FILE"
 
           echo
-          echo "Macro selection configuration:"
+          echo "Fixed macro indexes:"
           grep \
             -n \
             -E \
-            "GP6_MACRO_INDEX|GP7_MACRO_INDEX|MACRO_SELECTION_WINDOW_US" \
+            "GP6_MACRO_INDEX|GP7_MACRO_INDEX" \
             "$INPUT_MACRO_FILE"
 
           echo
-          echo "Persistent startup request:"
+          echo "Macro retry watchdog:"
           grep \
             -n \
-            -A 25 \
-            -B 8 \
-            "isMacroStartRequested" \
+            -A 35 \
+            -B 5 \
+            "shouldRetryMacroStart" \
             "$INPUT_MACRO_FILE"
 
       - name: Configure Pico firmware
@@ -1206,7 +1108,7 @@ jobs:
             echo "Pico UF2 was not generated"
 
             find gp2040-ce/build \
-              -maxdepth 5 \
+              -maxdepth 4 \
               -type f \
               | sort
 
@@ -1229,15 +1131,13 @@ jobs:
 
           test -n "${UF2_FILE:-}"
           test -f "$UF2_FILE"
-          test -s "$UF2_FILE"
 
-          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-Stable-FourA-Macro.uf2"
+          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-FourA-WatchdogMacro.uf2"
 
           cp \
             "$UF2_FILE" \
             "$OUTPUT_FILE"
 
-          test -f "$OUTPUT_FILE"
           test -s "$OUTPUT_FILE"
 
           sha256sum \
@@ -1250,15 +1150,14 @@ jobs:
             SHA256SUMS.txt
 
           echo
-          echo "SHA256:"
           cat SHA256SUMS.txt
 
       - name: Upload UF2 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GP2040-CE-v0.7.12-Switch2-Stable-FourA-Macro
+          name: GP2040-CE-v0.7.12-Switch2-FourA-WatchdogMacro
           path: |
-            GP2040-CE-v0.7.12-Switch2-Stable-FourA-Macro.uf2
+            GP2040-CE-v0.7.12-Switch2-FourA-WatchdogMacro.uf2
             SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
