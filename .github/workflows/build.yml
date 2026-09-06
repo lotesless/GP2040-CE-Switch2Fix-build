@@ -1,4 +1,4 @@
-name: Build GP2040-CE Switch 2 Four A Reliable Auto Recovery
+name: Build GP2040-CE Switch 2 Four A Reliable GP6 GP7
 
 on:
   workflow_dispatch:
@@ -577,22 +577,6 @@ jobs:
                   SequenceStage::MACRO_RUNNING;
           }
 
-          void recoverMacroStartIfStopped(
-              bool macroIsRunning
-          ) {
-              // If the official runner resets the macro in its
-              // first frame, restore the persistent request.
-              if (
-                  stage ==
-                      SequenceStage::MACRO_RUNNING &&
-                  !macroIsRunning
-              ) {
-                  macroStartRequest = true;
-                  stage =
-                      SequenceStage::START_MACRO;
-              }
-          }
-
           uint getSelectedGpio() {
               return useGp7Macro
                   ? GP7_PIN
@@ -801,13 +785,6 @@ jobs:
               checkMacroPress();
               checkMacroAction();
               runCurrentMacro();
-
-              // Recover only when playback really stopped;
-              // otherwise preserve the proven stable behavior.
-              Switch2FixSupport::
-                  recoverMacroStartIfStopped(
-                      isMacroRunning
-                  );
 
               Gamepad* gamepad =
                   Storage::getInstance()
@@ -1116,7 +1093,7 @@ jobs:
           test -n "${UF2_FILE:-}"
           test -f "$UF2_FILE"
 
-          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-FourA-ReliableAutoRecovery.uf2"
+          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-FourA-ReliableGP6GP7.uf2"
 
           cp \
             "$UF2_FILE" \
@@ -1139,9 +1116,9 @@ jobs:
       - name: Upload UF2 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GP2040-CE-v0.7.12-Switch2-FourA-ReliableAutoRecovery
+          name: GP2040-CE-v0.7.12-Switch2-FourA-ReliableGP6GP7
           path: |
-            GP2040-CE-v0.7.12-Switch2-FourA-ReliableAutoRecovery.uf2
+            GP2040-CE-v0.7.12-Switch2-FourA-ReliableGP6GP7.uf2
             SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
