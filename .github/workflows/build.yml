@@ -1,4 +1,4 @@
-name: Build GP2040-CE Switch 2 Four A 5s Fallback
+name: Build GP2040-CE Switch 2 Four A 5s 20s Persistent Fallback
 
 on:
   workflow_dispatch:
@@ -1099,7 +1099,7 @@ jobs:
           test -n "${UF2_FILE:-}"
           test -f "$UF2_FILE"
 
-          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-FourA-5sFallback.uf2"
+          OUTPUT_FILE="GP2040-CE-v0.7.12-Switch2-FourA-5s20sPersistent.uf2"
 
           cp \
             "$UF2_FILE" \
@@ -1122,9 +1122,9 @@ jobs:
       - name: Upload UF2 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GP2040-CE-v0.7.12-Switch2-FourA-5sFallback
+          name: GP2040-CE-v0.7.12-Switch2-FourA-5s20sPersistent
           path: |
-            GP2040-CE-v0.7.12-Switch2-FourA-5sFallback.uf2
+            GP2040-CE-v0.7.12-Switch2-FourA-5s20sPersistent.uf2
             SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
