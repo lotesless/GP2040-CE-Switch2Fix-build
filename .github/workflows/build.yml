@@ -268,7 +268,12 @@ jobs:
               120000;
 
           constexpr uint64_t MACRO_SELECTION_WINDOW_US =
-              10000000;
+              5000000;
+
+          // One internal backup start in the second half of
+          // the 5-10 second interval if Macro 2 is still stopped.
+          constexpr uint64_t MACRO_BACKUP_DELAY_US =
+              2500000;
 
           constexpr uint64_t BOOTSEL_POLL_INTERVAL_US =
               5000;
@@ -293,6 +298,8 @@ jobs:
 
           // This remains set until a valid macro is started.
           bool macroStartRequest = false;
+          bool macroBackupAttempted = false;
+          uint64_t macroBackupAt = 0;
 
           bool bootselRawPressed = false;
           bool bootselStablePressed = false;
@@ -353,6 +360,8 @@ jobs:
 
               useGp7Macro = false;
               macroStartRequest = false;
+              macroBackupAttempted = false;
+              macroBackupAt = 0;
 
               bootselRawPressed = false;
               bootselStablePressed = false;
@@ -547,9 +556,29 @@ jobs:
                       selectionEndsAt
                   ) {
                       macroStartRequest = true;
+                      macroBackupAttempted = false;
+                      macroBackupAt =
+                          getMicro() +
+                          MACRO_BACKUP_DELAY_US;
                       stage =
                           SequenceStage::START_MACRO;
                   }
+              }
+
+              // Keep the normal request untouched. If it did not
+              // produce a running macro, submit one explicit backup
+              // request once at 7.5 seconds after the fourth A.
+              if (
+                  stage ==
+                      SequenceStage::START_MACRO &&
+                  macroStartRequest &&
+                  !macroBackupAttempted &&
+                  macroBackupAt != 0 &&
+                  getMicro() >= macroBackupAt &&
+                  !isMacroRunning
+              ) {
+                  macroBackupAttempted = true;
+                  macroStartRequest = true;
               }
           }
 
