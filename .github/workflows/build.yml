@@ -268,10 +268,7 @@ jobs:
               120000;
 
           constexpr uint64_t MACRO_SELECTION_WINDOW_US =
-              5000000;
-
-          constexpr uint64_t FALLBACK_CHECK_INTERVAL_US = 500000;
-          constexpr uint64_t FALLBACK_CHECK_END_US = 10000000;
+              10000000;
 
           constexpr uint64_t BOOTSEL_POLL_INTERVAL_US =
               5000;
@@ -296,10 +293,6 @@ jobs:
 
           // This remains set until a valid macro is started.
           bool macroStartRequest = false;
-
-          bool fallbackCheckEnabled = false;
-          uint64_t fallbackCheckStartedAt = 0;
-          uint64_t fallbackLastCheckAt = 0;
 
           bool bootselRawPressed = false;
           bool bootselStablePressed = false;
@@ -360,9 +353,6 @@ jobs:
 
               useGp7Macro = false;
               macroStartRequest = false;
-              fallbackCheckEnabled = false;
-              fallbackCheckStartedAt = 0;
-              fallbackLastCheckAt = 0;
 
               bootselRawPressed = false;
               bootselStablePressed = false;
@@ -801,7 +791,6 @@ jobs:
               checkMacroPress();
               checkMacroAction();
               runCurrentMacro();
-              Switch2FixSupport::confirmMacroStarted(isMacroRunning);
 
               Gamepad* gamepad =
                   Storage::getInstance()
