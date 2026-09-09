@@ -1,4 +1,4 @@
-name: Build GP2040-CE Switch 2 Four A 7s 100ms Persistent
+name: Build GP2040-CE Switch 2 Four A Manual USER Macro
 
 on:
   workflow_dispatch:
@@ -245,11 +245,10 @@ jobs:
           enum class SequenceStage {
               WAITING_FOR_USB,
               AUTO_A,
-              MACRO_SELECTION,
-              START_MACRO,
-              MACRO_RUNNING
+              MANUAL_MACRO
           };
 
+          constexpr uint USER_PIN = 24;
           constexpr uint GP6_PIN = 6;
           constexpr uint GP7_PIN = 7;
 
@@ -258,106 +257,57 @@ jobs:
 
           constexpr uint64_t USB_SETTLE_DELAY_US =
               2000000;
-
           constexpr int AUTO_A_PRESS_COUNT = 4;
-
           constexpr uint64_t AUTO_A_INTERVAL_US =
               500000;
-
           constexpr uint64_t AUTO_A_HOLD_US =
               120000;
-
-          constexpr uint64_t MACRO_SELECTION_WINDOW_US =
-              10000000;
-
-          constexpr uint64_t BOOTSEL_POLL_INTERVAL_US =
-              5000;
-
-          constexpr uint64_t BOOTSEL_DEBOUNCE_US =
-              30000;
+          constexpr uint64_t USER_DEBOUNCE_US =
+              50000;
+          constexpr uint64_t USER_LONG_PRESS_US =
+              1000000;
 
           SequenceStage stage =
               SequenceStage::WAITING_FOR_USB;
-
           bool usbWasMounted = false;
-          uint64_t usbMountedAt = 0;
 
           int autoAPressCount = 0;
           bool autoAIsPressed = false;
           uint64_t autoAPressStartedAt = 0;
           uint64_t nextAutoAPressAt = 0;
 
-          uint64_t selectionEndsAt = 0;
-
+          bool macroStartRequest = false;
           bool useGp7Macro = false;
 
-          // This remains set until a valid macro is started.
-          bool macroStartRequest = false;
+          bool userRawPressed = false;
+          bool userStablePressed = false;
+          bool userLongPressHandled = false;
+          uint64_t userChangedAt = 0;
+          uint64_t userPressedAt = 0;
 
-          bool bootselRawPressed = false;
-          bool bootselStablePressed = false;
-          uint64_t bootselChangedAt = 0;
-          uint64_t bootselLastPollAt = 0;
+          void setupUserButton() {
+              gpio_init(USER_PIN);
+              gpio_set_dir(USER_PIN, GPIO_IN);
+              gpio_pull_up(USER_PIN);
+          }
 
-          bool __no_inline_not_in_flash_func(
-              readBootselButton
-          )() {
-              const uint CS_PIN_INDEX = 1;
-
-              uint32_t flags =
-                  save_and_disable_interrupts();
-
-              hw_write_masked(
-                  &ioqspi_hw->io[CS_PIN_INDEX].ctrl,
-                  GPIO_OVERRIDE_LOW
-                      << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
-                  IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
-              );
-
-              for (
-                  volatile int delay = 0;
-                  delay < 1000;
-                  ++delay
-              ) {
-                  __asm volatile("nop");
-              }
-
-              bool pressed =
-                  !(sio_hw->gpio_hi_in &
-                    (1u << CS_PIN_INDEX));
-
-              hw_write_masked(
-                  &ioqspi_hw->io[CS_PIN_INDEX].ctrl,
-                  GPIO_OVERRIDE_NORMAL
-                      << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
-                  IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS
-              );
-
-              restore_interrupts(flags);
-
-              return pressed;
+          bool readUserButton() {
+              return !gpio_get(USER_PIN);
           }
 
           void resetSession() {
-              stage =
-                  SequenceStage::WAITING_FOR_USB;
-
-              usbMountedAt = 0;
-
+              stage = SequenceStage::WAITING_FOR_USB;
               autoAPressCount = 0;
               autoAIsPressed = false;
               autoAPressStartedAt = 0;
               nextAutoAPressAt = 0;
-
-              selectionEndsAt = 0;
-
-              useGp7Macro = false;
               macroStartRequest = false;
-
-              bootselRawPressed = false;
-              bootselStablePressed = false;
-              bootselChangedAt = 0;
-              bootselLastPollAt = 0;
+              useGp7Macro = false;
+              userRawPressed = false;
+              userStablePressed = false;
+              userLongPressHandled = false;
+              userChangedAt = 0;
+              userPressedAt = 0;
           }
 
           void updateUsbConnection() {
@@ -368,202 +318,111 @@ jobs:
                   if (usbWasMounted) {
                       resetSession();
                   }
-
                   usbWasMounted = false;
                   return;
               }
 
               if (!usbWasMounted) {
                   resetSession();
-
+                  setupUserButton();
                   usbWasMounted = true;
-                  usbMountedAt = now;
-
                   nextAutoAPressAt =
-                      now +
-                      USB_SETTLE_DELAY_US;
-
-                  stage =
-                      SequenceStage::AUTO_A;
+                      now + USB_SETTLE_DELAY_US;
+                  stage = SequenceStage::AUTO_A;
               }
           }
 
-          void updateBootselEdges() {
-              if (
-                  stage !=
-                      SequenceStage::MACRO_SELECTION &&
-                  stage !=
-                      SequenceStage::START_MACRO &&
-                  stage !=
-                      SequenceStage::MACRO_RUNNING
-              ) {
+          void requestMacro(bool selectGp7) {
+              useGp7Macro = selectGp7;
+              macroStartRequest = true;
+          }
+
+          void updateUserButton() {
+              if (stage != SequenceStage::MANUAL_MACRO) {
                   return;
               }
 
               uint64_t now = getMicro();
+              bool rawPressed = readUserButton();
 
-              if (
-                  now - bootselLastPollAt <
-                  BOOTSEL_POLL_INTERVAL_US
-              ) {
-                  return;
+              if (rawPressed != userRawPressed) {
+                  userRawPressed = rawPressed;
+                  userChangedAt = now;
               }
 
-              bootselLastPollAt = now;
+              if (rawPressed != userStablePressed &&
+                  now - userChangedAt >= USER_DEBOUNCE_US) {
+                  userStablePressed = rawPressed;
 
-              bool rawPressed =
-                  readBootselButton();
-
-              if (
-                  rawPressed !=
-                  bootselRawPressed
-              ) {
-                  bootselRawPressed = rawPressed;
-                  bootselChangedAt = now;
+                  if (userStablePressed) {
+                      userPressedAt = now;
+                      userLongPressHandled = false;
+                  } else if (!userLongPressHandled &&
+                             now - userPressedAt <
+                                 USER_LONG_PRESS_US) {
+                      requestMacro(false);
+                  }
               }
 
-              if (
-                  rawPressed ==
-                      bootselStablePressed ||
-                  now - bootselChangedAt <
-                      BOOTSEL_DEBOUNCE_US
-              ) {
-                  return;
-              }
-
-              bool oldStableState =
-                  bootselStablePressed;
-
-              bootselStablePressed =
-                  rawPressed;
-
-              if (
-                  oldStableState ||
-                  !bootselStablePressed
-              ) {
-                  return;
-              }
-
-              if (
-                  stage ==
-                  SequenceStage::MACRO_SELECTION
-              ) {
-                  useGp7Macro = true;
-                  return;
-              }
-
-              if (
-                  stage ==
-                      SequenceStage::START_MACRO ||
-                  stage ==
-                      SequenceStage::MACRO_RUNNING
-              ) {
-                  useGp7Macro = !useGp7Macro;
-
-                  // Stop the old macro and keep a persistent
-                  // request to start the newly selected one.
-                  macroStartRequest = true;
-                  stage =
-                      SequenceStage::START_MACRO;
+              if (userStablePressed &&
+                  !userLongPressHandled &&
+                  now - userPressedAt >=
+                      USER_LONG_PRESS_US) {
+                  userLongPressHandled = true;
+                  requestMacro(true);
               }
           }
 
           void updateAutomaticA() {
-              if (
-                  stage !=
-                  SequenceStage::AUTO_A
-              ) {
+              if (stage != SequenceStage::AUTO_A) {
                   return;
               }
 
               uint64_t now = getMicro();
 
-              if (
-                  !autoAIsPressed &&
-                  autoAPressCount <
-                      AUTO_A_PRESS_COUNT &&
-                  now >= nextAutoAPressAt
-              ) {
+              if (!autoAIsPressed &&
+                  autoAPressCount < AUTO_A_PRESS_COUNT &&
+                  now >= nextAutoAPressAt) {
                   autoAIsPressed = true;
                   autoAPressStartedAt = now;
               }
 
-              if (!autoAIsPressed) {
-                  return;
-              }
-
-              if (
+              if (!autoAIsPressed ||
                   now - autoAPressStartedAt <
-                  AUTO_A_HOLD_US
-              ) {
+                      AUTO_A_HOLD_US) {
                   return;
               }
 
               autoAIsPressed = false;
               ++autoAPressCount;
 
-              if (
-                  autoAPressCount >=
-                  AUTO_A_PRESS_COUNT
-              ) {
-                  selectionEndsAt =
-                      now +
-                      MACRO_SELECTION_WINDOW_US;
-
-                  useGp7Macro = false;
-                  bootselRawPressed = false;
-                  bootselStablePressed = false;
-                  bootselChangedAt = now;
-                  bootselLastPollAt = 0;
-
-                  stage =
-                      SequenceStage::
-                          MACRO_SELECTION;
-
+              if (autoAPressCount >= AUTO_A_PRESS_COUNT) {
+                  stage = SequenceStage::MANUAL_MACRO;
+                  userRawPressed = readUserButton();
+                  userStablePressed = userRawPressed;
+                  userLongPressHandled = userStablePressed;
+                  userChangedAt = now;
+                  userPressedAt = now;
                   return;
               }
 
               nextAutoAPressAt =
-                  autoAPressStartedAt +
-                  AUTO_A_INTERVAL_US;
+                  autoAPressStartedAt + AUTO_A_INTERVAL_US;
           }
 
           void updateSequence() {
               updateUsbConnection();
-
               if (!usbWasMounted) {
                   return;
               }
-
               updateAutomaticA();
-              updateBootselEdges();
-
-              if (
-                  stage ==
-                  SequenceStage::MACRO_SELECTION
-              ) {
-                  if (
-                      getMicro() >=
-                      selectionEndsAt
-                  ) {
-                      macroStartRequest = true;
-                      stage =
-                          SequenceStage::START_MACRO;
-                  }
-              }
+              updateUserButton();
           }
 
-          void applyAutomaticA(
-              Gamepad* gamepad
-          ) {
-              if (
-                  stage ==
-                      SequenceStage::AUTO_A &&
-                  autoAIsPressed
-              ) {
-                  // SwitchProDriver maps B2 to Nintendo A.
-                  gamepad->state.buttons |=
-                      GAMEPAD_MASK_B2;
+          void applyAutomaticA(Gamepad* gamepad) {
+              if (stage == SequenceStage::AUTO_A &&
+                  autoAIsPressed) {
+                  gamepad->state.buttons |= GAMEPAD_MASK_B2;
               }
           }
 
@@ -573,14 +432,10 @@ jobs:
 
           void markMacroStarted() {
               macroStartRequest = false;
-              stage =
-                  SequenceStage::MACRO_RUNNING;
           }
 
           uint getSelectedGpio() {
-              return useGp7Macro
-                  ? GP7_PIN
-                  : GP6_PIN;
+              return useGp7Macro ? GP7_PIN : GP6_PIN;
           }
 
           int getFallbackMacroIndex() {
@@ -834,7 +689,7 @@ jobs:
           )
 
           print(
-              "Reliable four-A GP6/GP7 patch applied"
+              "Four-A manual USER GP6/GP7 patch applied"
           )
           print(
               "Automatic A count: 4"
@@ -849,7 +704,7 @@ jobs:
               "BOOTSEL macro: GP7"
           )
           print(
-              "Macro request retries until valid start"
+              "USER GP24 short press selects GP6; long press selects GP7"
           )
           print(
               "GP6 fallback index: Macro 2"
