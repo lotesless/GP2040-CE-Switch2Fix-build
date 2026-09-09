@@ -808,11 +808,23 @@ jobs:
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "readBootselButton" \
+            "USER_PIN = 24" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
-            "restore_interrupts(flags)" \
+            "USER_LONG_PRESS_US" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "gpio_pull_up(USER_PIN)" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "requestMacro(false)" \
+            "$INPUT_MACRO_FILE"
+
+          grep -q \
+            "requestMacro(true)" \
             "$INPUT_MACRO_FILE"
 
           grep -q \
@@ -851,7 +863,7 @@ jobs:
             exit 1
           fi
 
-          echo "Reliable patch verification passed"
+          echo "Manual USER patch verification passed"
 
           echo
           echo "InputMacro functions:"
@@ -870,7 +882,7 @@ jobs:
             "$INPUT_MACRO_FILE"
 
           echo
-          echo "Reliable macro fallback:"
+          echo "Manual USER macro selection:"
           grep \
             -n \
             -A 35 \
